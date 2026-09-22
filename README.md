@@ -226,6 +226,55 @@ Fields: `url`, `input`, `send`, `response`, `busy`, `login`, `login_hosts`,
 - Headless Chromium is more likely to hit bot checks (Cloudflare and similar),
   which is why the browser runs headed by default.
 
+## Controlling a browser you already have open
+
+`control browser` normally launches its own Chromium with a persistent, isolated
+profile. Sometimes you want the opposite: drive the Brave/Chrome/Chromium window
+the *user* already has open, with their real logins and tabs.
+
+### Chromium/Brave: Chrome DevTools Protocol (precise, DOM-level)
+
+Start the browser with a debug port open (do this once, before running any
+`control browser` command against it):
+
+```
+brave --remote-debugging-port=9222
+# or: chromium --remote-debugging-port=9222
+# or: google-chrome --remote-debugging-port=9222
+```
+
+Then point `control browser` at that port instead of launching a new browser:
+
+```
+control browser attach --port 9222 --json          # sanity check: lists open tabs
+control browser --cdp-port 9222 goto github.com     # navigates the first existing tab
+control browser --cdp-port 9222 click "a.header-search-button"
+control browser --cdp-port 9222 snapshot            # same click/fill/eval/snapshot as always
+```
+
+`--cdp-port` on the `browser` subcommand applies to `goto`, `click`, `fill`,
+`eval` and `snapshot`: they operate on the already-open browser's first tab
+(creating one if none exists) instead of starting a fresh, isolated Chromium.
+Closing the command never closes the browser or its tabs — it only disconnects.
+If the debug port isn't reachable (browser not started with
+`--remote-debugging-port`, or wrong port number), the command fails with a clear
+`cannot reach a Chromium debug port at localhost:PORT` error instead of a raw
+Playwright traceback.
+
+### Any other browser (Firefox, or Chromium without a debug port): keyboard fallback
+
+No DOM access here — this is a blind "focus the window, then type" fallback,
+useful for a quick navigation when CDP isn't an option:
+
+```
+control browser focus-and-goto "Brave" "https://example.com"
+control browser focus-and-goto "Firefox" gemini     # site aliases resolve too
+```
+
+It focuses the first window matching the pattern (via `windows.py`), presses
+Ctrl+L to reach the address bar, types the URL (via `input.py`) and presses
+Enter. No selectors, no return value beyond the window it acted on.
+
 ## Running several agents in parallel
 
 Several agents can drive the same Plasma session at once. Each one gets its own

@@ -460,6 +460,13 @@ def _read_question(args: argparse.Namespace) -> str:
     return args._question
 
 
+def _open_browser(args: argparse.Namespace, headless: bool | None = None) -> Browser:
+    cdp_port = getattr(args, "cdp_port", None)
+    if cdp_port:
+        return Browser.attach(port=cdp_port)
+    return Browser(headless=args.headless if headless is None else headless)
+
+
 def _browser_command(run: Callable[[Browser, argparse.Namespace], dict],
                      text: Callable[[dict], str], headless: bool | None = None,
                      validate: Callable[[argparse.Namespace], None] | None = None):
@@ -467,9 +474,11 @@ def _browser_command(run: Callable[[Browser, argparse.Namespace], dict],
     def handler(args: argparse.Namespace) -> Out:
         if validate is not None:
             validate(args)  # fail fast, before a Chromium window pops up
-        with Browser(headless=args.headless if headless is None else headless) as b:
+        with _open_browser(args, headless) as b:
             data = run(b, args)
-        data["profile"] = str(b.profile)
+        data["profile"] = str(b.profile) if b.profile is not None else None
+        if b.cdp_port is not None:
+            data["cdp_port"] = b.cdp_port
         return Out(data, text(data))
 
     return handler
@@ -500,6 +509,23 @@ _cmd_browser_login = _browser_command(
     headless=False,
     validate=lambda a: browser_mod.get_site(a.site),
 )
+
+
+@command
+def _cmd_browser_attach(args: argparse.Namespace) -> Out:
+    with Browser.attach(port=args.port) as b:
+        tabs = [{"url": p.url, "title": p.title()} for p in b.pages]
+    data = _ok("attach", port=args.port, tabs=tabs)
+    return Out(data, f"attached on port {args.port}: {len(tabs)} tab(s)")
+
+
+@command
+def _cmd_browser_focus_and_goto(args: argparse.Namespace) -> Out:
+    """Fallback for browsers without CDP: focus a window, then Ctrl+L + type + Enter."""
+    url = browser_mod.resolve_url(args.url)
+    win = _find_window(args.window, args)
+    browser_mod.focus_and_goto(win, url)
+    return Out(_ok("focus_and_goto", window=win.to_dict(), url=url), f"{win.id}\t-> {url}")
 
 
 @command
@@ -714,6 +740,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     browser = sub.add_parser("browser", help="DOM-precise browser control (Playwright/Chromium)")
     browser.add_argument("--headless", action="store_true", help="run Chromium headless")
+    browser.add_argument(
+        "--cdp-port", type=int, default=None, metavar="PORT",
+        help="drive a Chromium already running (started with "
+             "--remote-debugging-port=PORT) instead of launching one; "
+             "applies to goto/click/fill/eval/snapshot",
+    )
     browser_sub = browser.add_subparsers(dest="browser_command", required=True)
 
     b = leaf(browser_sub, "goto", _cmd_browser_goto,
@@ -731,6 +763,19 @@ def build_parser() -> argparse.ArgumentParser:
     b.add_argument("expression")
 
     leaf(browser_sub, "snapshot", _cmd_browser_snapshot, help="dump the visible text of the active page")
+
+    b = leaf(browser_sub, "attach", _cmd_browser_attach,
+             help="connect to a Chromium already running with --remote-debugging-port "
+                  "and list its open tabs")
+    b.add_argument("--port", type=int, default=browser_mod.DEFAULT_CDP_PORT,
+                   help=f"debug port (default: {browser_mod.DEFAULT_CDP_PORT})")
+
+    b = leaf(browser_sub, "focus-and-goto", _cmd_browser_focus_and_goto,
+             help="fallback for browsers with no CDP access: focus a window by pattern "
+                  "and type a URL via Ctrl+L")
+    b.add_argument("window", metavar="PATTERN", help="window title/class pattern to focus")
+    b.add_argument("url")
+    add_desktop_option(b)
 
     leaf(browser_sub, "sites", _cmd_browser_sites, help="list the AI site shortcuts")
 

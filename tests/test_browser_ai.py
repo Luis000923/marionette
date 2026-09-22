@@ -56,11 +56,16 @@ class FakePage:
         self.visited.append(url)
         self.url = url
 
+    def title(self) -> str:
+        return ""
+
     def query_selector_all(self, selector: str) -> list[FakeElement]:
         return list(self.elements.get(selector, []))
 
 
 class FakeBrowser:
+    cdp_port: int | None = None
+
     def __init__(self, page: FakePage, profile: Path | None = None):
         self._pages = [page]
         self.profile = profile or Path("/nonexistent")
@@ -440,6 +445,59 @@ class TestAskCommand:
         assert json.loads(capsys.readouterr().out)["logged_in"] is True
 
 
+class TestAttachCommand:
+    def test_json_output(self, monkeypatch, tmp_path, capsys):
+        fake = _CtxBrowser(FakePage("https://example.com/"), profile=None)
+        fake.cdp_port = 9222
+        seen = {}
+
+        def make(port=browser.DEFAULT_CDP_PORT, headless=False):
+            seen["port"] = port
+            return fake
+
+        monkeypatch.setattr(cli.Browser, "attach", staticmethod(make))
+        assert _main(["--json", "browser", "attach", "--port", "9222"], monkeypatch) == 0
+        data = json.loads(capsys.readouterr().out)
+        assert seen["port"] == 9222
+        assert data["port"] == 9222
+        assert data["tabs"] == [{"url": "https://example.com/", "title": ""}]
+
+    def test_unreachable_port_reports_a_clear_error(self, monkeypatch, capsys):
+        def make(port=browser.DEFAULT_CDP_PORT, headless=False):
+            raise browser.BrowserError(
+                f"cannot reach a Chromium debug port at localhost:{port}",
+                hint="open the browser with --remote-debugging-port=9222 first",
+            )
+
+        monkeypatch.setattr(cli.Browser, "attach", staticmethod(make))
+        assert _main(["--json", "browser", "attach"], monkeypatch) == 1
+        err = json.loads(capsys.readouterr().out)
+        assert "cannot reach" in err["error"]
+        assert "--remote-debugging-port" in err["hint"]
+
+
+class TestFocusAndGotoCommand:
+    def test_focuses_and_types_the_resolved_url(self, monkeypatch, capsys):
+        class FakeWindow:
+            id, title = "0x1", "Brave"
+
+            def to_dict(self):
+                return {"id": self.id, "title": self.title}
+
+        win = FakeWindow()
+        monkeypatch.setattr(cli, "_find_window", lambda pattern, args: win)
+        calls = []
+        monkeypatch.setattr(browser, "focus_and_goto",
+                            lambda w, u: calls.append((w, u)))
+        assert _main(
+            ["--json", "browser", "focus-and-goto", "Brave", "gemini"], monkeypatch
+        ) == 0
+        data = json.loads(capsys.readouterr().out)
+        assert calls == [(win, "https://gemini.google.com/app")]
+        assert data["url"] == "https://gemini.google.com/app"
+        assert data["window"] == {"id": "0x1", "title": "Brave"}
+
+
 class TestProfileLock:
     def test_profile_in_use_gives_a_clear_error(self, tmp_path):
         class FakeChromium:
@@ -462,3 +520,156 @@ class TestProfileLock:
                 browser.Browser(profile=tmp_path)
         assert "--session" in exc.value.hint
         assert FakePlaywright.stopped
+
+
+class TestCdpAttach:
+    """`Browser(cdp_port=...)` connects to an already-open Chromium instead of
+    launching a fresh one."""
+
+    def _starter(self, cdp_browser):
+        class FakeChromium:
+            def connect_over_cdp(self, url):
+                self.url = url
+                return cdp_browser
+
+        class FakePlaywright:
+            def __init__(self):
+                self.chromium = FakeChromium()
+                self.stopped = False
+
+            def stop(self):
+                self.stopped = True
+
+        class Starter:
+            def __init__(self):
+                self.instance = FakePlaywright()
+
+            def start(self):
+                return self.instance
+
+        return Starter()
+
+    def test_attaches_to_the_first_existing_context(self):
+        page = FakePage("https://example.com/")
+
+        class FakeCdpContext:
+            pages = [page]
+
+        class FakeCdpBrowser:
+            contexts = [FakeCdpContext()]
+
+        starter = self._starter(FakeCdpBrowser())
+        with patch("control.browser.sync_playwright", return_value=starter):
+            b = browser.Browser(cdp_port=9222)
+        assert starter.instance.chromium.url == "http://localhost:9222"
+        assert b.cdp_port == 9222
+        assert b.profile is None
+        assert b.active_tab() is page
+
+    def test_creates_a_context_when_none_exists_yet(self):
+        new_context = object()
+
+        class FakeCdpBrowser:
+            contexts = []
+
+            def new_context(self):
+                return new_context
+
+        starter = self._starter(FakeCdpBrowser())
+        with patch("control.browser.sync_playwright", return_value=starter):
+            b = browser.Browser(cdp_port=9222)
+        assert b.context is new_context
+
+    def test_close_disconnects_without_closing_the_users_tabs(self):
+        page = FakePage("https://example.com/")
+
+        class FakeCdpContext:
+            pages = [page]
+
+            def close(self):
+                raise AssertionError("attached context must not be closed")
+
+        class FakeCdpBrowser:
+            contexts = [FakeCdpContext()]
+
+        starter = self._starter(FakeCdpBrowser())
+        with patch("control.browser.sync_playwright", return_value=starter):
+            b = browser.Browser(cdp_port=9222)
+            b.close()
+        assert starter.instance.stopped
+
+    def test_unreachable_port_is_reported_without_a_raw_traceback(self):
+        class FakeChromium:
+            def connect_over_cdp(self, url):
+                raise Exception("connect ECONNREFUSED 127.0.0.1:9222")
+
+        class FakePlaywright:
+            def __init__(self):
+                self.chromium = FakeChromium()
+                self.stopped = False
+
+            def stop(self):
+                self.stopped = True
+
+        class Starter:
+            def __init__(self):
+                self.instance = FakePlaywright()
+
+            def start(self):
+                return self.instance
+
+        starter = Starter()
+        with patch("control.browser.sync_playwright", return_value=starter):
+            with pytest.raises(browser.BrowserError, match="9222") as exc:
+                browser.Browser(cdp_port=9222)
+        assert "--remote-debugging-port" in exc.value.hint
+        assert starter.instance.stopped
+
+    def test_attach_classmethod_uses_the_default_port(self):
+        page = FakePage("https://example.com/")
+
+        class FakeCdpContext:
+            pages = [page]
+
+        class FakeCdpBrowser:
+            contexts = [FakeCdpContext()]
+
+        starter = self._starter(FakeCdpBrowser())
+        with patch("control.browser.sync_playwright", return_value=starter):
+            b = browser.Browser.attach()
+        assert starter.instance.chromium.url == f"http://localhost:{browser.DEFAULT_CDP_PORT}"
+        assert b.cdp_port == browser.DEFAULT_CDP_PORT
+
+
+class TestFocusAndGoto:
+    def test_focuses_the_window_and_types_the_url(self):
+        class FakeWindow:
+            id, title = "0x1", "Brave"
+
+            def __init__(self):
+                self.focused = False
+
+            def focus(self):
+                self.focused = True
+                return True
+
+        win = FakeWindow()
+        pressed = []
+        with patch("control.input.key_combo", side_effect=lambda *k: pressed.append(("combo", k))), \
+             patch("control.input.type_text", side_effect=lambda t: pressed.append(("type", t))), \
+             patch("control.input.press_key", side_effect=lambda k: pressed.append(("key", k))):
+            browser.focus_and_goto(win, "https://example.com")
+        assert win.focused
+        assert pressed == [
+            ("combo", ("ctrl", "l")), ("type", "https://example.com"), ("key", "enter"),
+        ]
+
+    def test_focus_failure_is_a_clear_browser_error(self):
+        class FakeWindow:
+            id, title = "0x1", "Brave"
+
+            def focus(self):
+                return False
+
+        with pytest.raises(browser.BrowserError, match="did not take focus"):
+            browser.focus_and_goto(FakeWindow(), "https://example.com")

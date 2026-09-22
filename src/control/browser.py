@@ -18,10 +18,13 @@ import os
 import time
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 from urllib.parse import urlparse
 
 from playwright.sync_api import BrowserContext, Page, sync_playwright
+
+if TYPE_CHECKING:
+    from . import windows
 
 #: Shared profile, used when no session is active (unchanged default).
 PROFILE_DIR = Path.home() / ".local/share/control/browser-profile"
@@ -220,18 +223,47 @@ def resolve_url(target: str) -> str:
                       f"(known: {', '.join(sorted(catalog))})")
 
 
-class Browser:
-    """Thin wrapper around a persistent Playwright Chromium context.
+#: Default Chrome DevTools Protocol debug port (`--remote-debugging-port=9222`).
+DEFAULT_CDP_PORT = 9222
 
-    Persistent context keeps cookies/logins across runs, like a normal browser profile.
+
+class Browser:
+    """Thin wrapper around a Playwright Chromium context.
+
+    Two ways to get one: `Browser(profile=...)` launches its own, persistent
+    context (keeps cookies/logins across runs, like a normal browser profile).
+    `Browser(cdp_port=...)` / `Browser.attach(port)` instead connects to a
+    Chromium the user already has open (started with
+    `--remote-debugging-port=PORT`), and drives its first tab -- no separate
+    profile, no new window.
     """
 
-    def __init__(self, headless: bool = False, profile: Path | str | None = None):
+    def __init__(self, headless: bool = False, profile: Path | str | None = None,
+                cdp_port: int | None = None):
         self._playwright = sync_playwright().start()
+        self.cdp_port = cdp_port
+        if cdp_port is not None:
+            self.profile = None
+            try:
+                self._browser = self._playwright.chromium.connect_over_cdp(
+                    f"http://localhost:{cdp_port}"
+                )
+            except Exception as exc:
+                self._playwright.stop()
+                raise BrowserError(
+                    f"cannot reach a Chromium debug port at localhost:{cdp_port}: {exc}",
+                    hint=f"open the browser with --remote-debugging-port={cdp_port} "
+                         "first (see README), or check the port number",
+                ) from exc
+            self.context: BrowserContext = (
+                self._browser.contexts[0] if self._browser.contexts
+                else self._browser.new_context()
+            )
+            return
         self.profile = Path(profile) if profile is not None else profile_dir()
         self.profile.mkdir(parents=True, exist_ok=True)
         try:
-            self.context: BrowserContext = self._playwright.chromium.launch_persistent_context(
+            self.context = self._playwright.chromium.launch_persistent_context(
                 str(self.profile), headless=headless, viewport=None,
             )
         except Exception as exc:
@@ -243,6 +275,11 @@ class Browser:
                          "its own profile with --session NAME",
                 ) from exc
             raise
+
+    @classmethod
+    def attach(cls, port: int = DEFAULT_CDP_PORT, headless: bool = False) -> "Browser":
+        """Connect to a Chromium already running with `--remote-debugging-port=PORT`."""
+        return cls(headless=headless, cdp_port=port)
 
     @property
     def pages(self) -> list[Page]:
@@ -281,7 +318,10 @@ class Browser:
         return (page or self.active_tab()).text_content(selector)
 
     def close(self) -> None:
-        self.context.close()
+        # Attached mode: the context/tabs belong to the user's own browser, so
+        # only disconnect -- closing them would yank their open tabs away.
+        if self.cdp_port is None:
+            self.context.close()
         self._playwright.stop()
 
     def __enter__(self) -> "Browser":
@@ -465,6 +505,30 @@ def ask(browser: "Browser", site_name: str, question: str,
                 raise LoginRequired(f"{site.name} asked for a login instead of answering")
             raise ResponseTimeout(f"{site.name} produced no answer within {timeout:.0f}s")
         _sleep(POLL_INTERVAL)
+
+
+# --- keyboard fallback, for browsers with no CDP/DOM access (e.g. Firefox) -----
+
+def focus_and_goto(window: "windows.Window", url: str) -> None:
+    """Navigate a browser window to `url` by focusing it and typing, not the DOM.
+
+    The only way in when the browser wasn't opened with a debug port: focus the
+    window (`windows.py`), press Ctrl+L to reach the address bar, type the URL
+    and press Enter (`input.py`). Works on any browser, but is blind -- no
+    selectors, no return value beyond "the keys were sent".
+    """
+    from . import input as inp
+
+    if not window.focus():
+        raise BrowserError(
+            f"window {window.id} ({window.title!r}) did not take focus",
+            hint="KWin focus-stealing prevention may be blocking it; "
+                 "try 'control win activate' first",
+        )
+    with inp.input_lock():
+        inp.key_combo("ctrl", "l")
+        inp.type_text(url)
+        inp.press_key("enter")
 
 
 def wait_for_login(browser: "Browser", site_name: str, timeout: float = 300.0) -> str:
