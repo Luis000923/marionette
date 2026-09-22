@@ -7,9 +7,16 @@ mutex is reentrant so composite gestures hold it for their whole sequence.
 """
 from __future__ import annotations
 
+import re
+import shutil
+import string
 import subprocess
+import sys
+import tempfile
+import time
 from contextlib import contextmanager
-from typing import Iterator
+from pathlib import Path
+from typing import Iterator, Sequence
 
 from .locking import FileMutex, LockTimeout  # noqa: F401 - LockTimeout re-exported for callers
 
@@ -69,9 +76,21 @@ class YdotoolError(RuntimeError):
     pass
 
 
+def _argv(args: list[str]) -> list[str | bytes]:
+    """Command-line arguments as UTF-8, even under a C/Latin-1 locale.
+
+    subprocess encodes str arguments with the filesystem encoding, which under
+    LANG=C is ASCII: "señor" would raise UnicodeEncodeError before ydotool ran.
+    """
+    if (sys.getfilesystemencoding() or "").lower().replace("-", "") == "utf8":
+        return list(args)
+    return [a.encode("utf-8") for a in args]
+
+
 def _run(*args: str) -> None:
     with input_mutex:
-        result = subprocess.run(["ydotool", *args], capture_output=True, text=True, timeout=15)
+        result = subprocess.run(_argv(["ydotool", *args]), capture_output=True, text=True,
+                                encoding="utf-8", errors="replace", timeout=15)
     if result.returncode != 0:
         raise YdotoolError(
             f"ydotool {' '.join(args)} failed: {result.stderr.strip() or result.stdout.strip()}\n"
@@ -79,8 +98,60 @@ def _run(*args: str) -> None:
         )
 
 
+#: Closed-loop pointer placement: at most this many corrective moves.
+MAX_POINTER_CORRECTIONS = 25
+#: Relative moves up to this size land ~1:1; bigger ones get accelerated by
+#: libinput (up to ~2x), so only half the remaining distance is sent at once.
+_EXACT_STEP = 16
+
+
+def pointer_position() -> tuple[int, int] | None:
+    """Where the compositor has the pointer (via kdotool), or None if unknown."""
+    tool = shutil.which("kdotool")
+    if tool is None:
+        return None
+    try:
+        out = subprocess.run([tool, "getmouselocation"], capture_output=True, text=True,
+                             timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    m = re.search(r"x:(-?\d+)\s+y:(-?\d+)", out)
+    return (int(m.group(1)), int(m.group(2))) if m else None
+
+
+def _damped(delta: int) -> int:
+    return delta if abs(delta) <= _EXACT_STEP else round(delta / 2)
+
+
+def _steer(x: int, y: int) -> bool:
+    """Walk the pointer onto (x, y) with relative moves, reading its real position
+    back after each one. False when no position feedback is available."""
+    pos = None
+    for _ in range(MAX_POINTER_CORRECTIONS):
+        pos = pointer_position()
+        if pos is None:
+            return False
+        dx, dy = x - pos[0], y - pos[1]
+        if not dx and not dy:
+            return True
+        _run("mousemove", "-x", str(_damped(dx)), "-y", str(_damped(dy)))
+    raise YdotoolError(f"the pointer did not reach {x},{y} (it is at {pos[0]},{pos[1]}); "
+                       "are the coordinates on screen?")
+
+
 def move_mouse(x: int, y: int) -> None:
-    _run("mousemove", "--absolute", "-x", str(x), "-y", str(y))
+    """Put the pointer exactly on (x, y), in compositor (logical) coordinates.
+
+    ydotool 1.0's `--absolute` is unreliable on Wayland: it slams the pointer to
+    0,0 and the follow-up move is lost or scaled by pointer acceleration, so the
+    pointer typically ends up at 1,1 whatever was asked. The absolute move is
+    kept as a starting point, then corrected in a closed loop with kdotool's
+    real pointer position (3-4 moves, ~40 ms). Without kdotool the absolute
+    move is all there is.
+    """
+    with input_mutex:
+        _run("mousemove", "--absolute", "-x", str(x), "-y", str(y))
+        _steer(x, y)
 
 
 def move_mouse_relative(dx: int, dy: int) -> None:
@@ -100,14 +171,45 @@ def double_click(button: str = "left", x: int | None = None, y: int | None = Non
         click(button)
 
 
-def drag(x1: int, y1: int, x2: int, y2: int, button: str = "left") -> None:
-    # The button must stay down for the whole gesture: never let another agent
-    # in between the press and the release.
+#: Indirection so tests can run gestures without real pauses.
+_sleep = time.sleep
+
+DEFAULT_DRAG_STEPS = 20
+DEFAULT_DRAG_HOLD_MS = 150
+
+
+def drag(x1: int, y1: int, x2: int, y2: int, button: str = "left",
+         steps: int = DEFAULT_DRAG_STEPS, hold_ms: int = DEFAULT_DRAG_HOLD_MS) -> None:
+    """Press at (x1, y1), glide to (x2, y2) in `steps` moves, release.
+
+    A single jump from press to release is too fast for real drag-and-drop:
+    file managers only start a drag after the pointer moved with the button
+    down, and web drop zones only accept a drop after `dragenter`/`dragover`,
+    which need intermediate motion. So the pointer moves in steps, pausing
+    `hold_ms` after the press and again over the target before letting go.
+
+    The button must stay down for the whole gesture -- no other agent may cut
+    in between press and release -- and must never stay down afterwards: if a
+    move fails midway, the release is still sent.
+    """
+    steps = max(1, steps)
+    pause = max(0, hold_ms) / 1000
     with input_mutex:
         move_mouse(x1, y1)
         _run("click", _button_code(button, "down"))
-        move_mouse(x2, y2)
-        _run("click", _button_code(button, "up"))
+        try:
+            _sleep(pause)
+            for i in range(1, steps + 1):
+                x, y = round(x1 + (x2 - x1) * i / steps), round(y1 + (y2 - y1) * i / steps)
+                # Relative moves only while the button is down: an absolute move
+                # would first drag whatever we hold to the screen's corner.
+                if not _steer(x, y):
+                    _run("mousemove", "--absolute", "-x", str(x), "-y", str(y))
+                if steps > 1:
+                    _sleep(pause / steps)
+            _sleep(pause)
+        finally:
+            _run("click", _button_code(button, "up"))
 
 
 def scroll(amount: int) -> None:
@@ -133,3 +235,220 @@ def key_combo(*keys: str) -> None:
 
 def press_key(name: str) -> None:
     key_combo(name)
+
+
+# --- Wayland clipboard (wl-clipboard) -------------------------------------------
+# Copying a file's URI and pasting it with Ctrl+V skips a GTK/KDE file dialog
+# entirely: Chromium accepts pasted files from `text/uri-list`, and so do file
+# managers and most upload drop zones that listen to `paste`.
+
+class ClipboardError(RuntimeError):
+    pass
+
+
+def _wl(tool: str) -> str:
+    path = shutil.which(tool)
+    if path is None:
+        raise ClipboardError(
+            f"{tool} not found; install wl-clipboard (e.g. sudo pacman -S wl-clipboard)"
+        )
+    return path
+
+
+def clipboard_available() -> bool:
+    return shutil.which("wl-copy") is not None
+
+
+def copy_to_clipboard(data: str | bytes, mime: str | None = None) -> None:
+    """Put `data` on the Wayland clipboard (optionally announced as `mime`).
+
+    wl-copy forks a child that keeps serving the clipboard until something
+    else is copied. That child inherits our stdio, so waiting on a pipe would
+    hang until the next copy: stdout goes to /dev/null and stderr to a file.
+    """
+    args = [_wl("wl-copy")]
+    if mime:
+        args += ["--type", mime]
+    # Always UTF-8, whatever the locale says: that is what text/plain means on
+    # Wayland, and what every toolkit decodes a paste as.
+    payload = data.encode("utf-8") if isinstance(data, str) else data
+    with tempfile.TemporaryFile() as err:
+        result = subprocess.run(args, input=payload, stdout=subprocess.DEVNULL,
+                                stderr=err, timeout=15)
+        if result.returncode != 0:
+            err.seek(0)
+            raise ClipboardError(f"wl-copy failed: {err.read().decode(errors='replace').strip()}")
+
+
+def _existing(paths: Sequence[str | Path]) -> list[Path]:
+    resolved = [Path(raw).expanduser().resolve() for raw in paths]
+    missing = [str(p) for p in resolved if not p.exists()]
+    if missing:
+        raise ClipboardError(f"no such file: {', '.join(missing)}")
+    return resolved
+
+
+def file_uri_list(paths: Sequence[str | Path]) -> str:
+    """`text/uri-list` body for local files (absolute, percent-encoded, CRLF-separated)."""
+    return "".join(f"{p.as_uri()}\r\n" for p in _existing(paths))
+
+
+def copy_files(paths: Sequence[str | Path]) -> list[str]:
+    """Copy files the way a file manager does, ready for Ctrl+V into a page.
+    Returns the absolute paths that were put on the clipboard."""
+    copy_to_clipboard(file_uri_list(paths), mime="text/uri-list")
+    return [str(p) for p in _existing(paths)]
+
+
+def _wl_paste(*args: str) -> bytes | None:
+    """Raw wl-paste output; None when the clipboard is empty."""
+    result = subprocess.run([_wl("wl-paste"), *args], capture_output=True, timeout=15)
+    if result.returncode != 0:
+        message = result.stderr.decode("utf-8", errors="replace").strip()
+        if "No selection" in message or "Nothing is copied" in message:
+            return None
+        raise ClipboardError(f"wl-paste failed: {message}")
+    return result.stdout
+
+
+def read_clipboard(mime: str | None = None) -> str:
+    # Bytes in, decoded as UTF-8 here: text=True would use the locale's
+    # encoding, and a Latin-1 or C locale turns "ó" into "Ã³" or worse.
+    args = ["--no-newline"] + (["--type", mime] if mime else [])
+    data = _wl_paste(*args)
+    return "" if data is None else data.decode("utf-8", errors="replace")
+
+
+#: Text flavours worth saving before a paste and putting back afterwards, best first.
+_RESTORABLE = ("text/uri-list", "text/plain;charset=utf-8", "text/plain", "UTF8_STRING")
+
+
+def _save_clipboard() -> tuple[str, bytes] | None:
+    """(mime, bytes) of the current clipboard; ("", b"") when it is empty;
+    None when it holds something that can't be put back (an image...)."""
+    try:
+        listed = _wl_paste("--list-types")
+    except ClipboardError:
+        return None
+    if listed is None:
+        return ("", b"")
+    types = listed.decode("utf-8", errors="replace").split()
+    for mime in _RESTORABLE:
+        if mime in types:
+            data = _wl_paste("--no-newline", "--type", mime)
+            return (mime, data or b"")
+    return None
+
+
+def clear_clipboard() -> None:
+    subprocess.run([_wl("wl-copy"), "--clear"], stdout=subprocess.DEVNULL,
+                   stderr=subprocess.DEVNULL, timeout=15)
+
+
+DEFAULT_PASTE_KEYS = ("ctrl", "v")
+#: Terminals take Ctrl+V as "insert next character literally", not paste.
+TERMINAL_PASTE_KEYS = ("ctrl", "shift", "v")
+TERMINAL_CLASSES = ("kitty", "konsole", "alacritty", "foot", "wezterm", "xterm", "terminal",
+                    "yakuake", "tilix", "ghostty")
+#: How long the target app gets to read a paste before the clipboard is put back:
+#: Wayland apps fetch the data asynchronously after the key press.
+PASTE_SETTLE = 0.3
+
+
+def paste_keys_for(window_class: str | None) -> tuple[str, ...]:
+    name = (window_class or "").lower()
+    return TERMINAL_PASTE_KEYS if any(t in name for t in TERMINAL_CLASSES) else DEFAULT_PASTE_KEYS
+
+
+def paste(keys: Sequence[str] = DEFAULT_PASTE_KEYS) -> None:
+    """Press the paste shortcut (Ctrl+V by default) in whatever has focus."""
+    key_combo(*keys)
+
+
+def paste_text(text: str, keys: Sequence[str] = DEFAULT_PASTE_KEYS, restore: bool = True) -> bool:
+    """Enter `text` in the focused widget through the clipboard, byte-exact UTF-8.
+
+    With `restore`, whatever text/file list was on the clipboard before is put
+    back afterwards (an empty clipboard is cleared again). Returns whether the
+    previous contents were restored; False when they couldn't be (e.g. an image).
+    Note that a clipboard manager (Klipper) may still record the pasted text in
+    its history: don't paste secrets this way.
+    """
+    with input_mutex:
+        saved = _save_clipboard() if restore else None
+        copy_to_clipboard(text)
+        key_combo(*keys)
+        _sleep(PASTE_SETTLE)
+        if saved is None:
+            return False
+        mime, data = saved
+        if mime:
+            copy_to_clipboard(data, mime=mime)
+        else:
+            clear_clipboard()
+        return True
+
+
+# --- choosing between typing and pasting ----------------------------------------------
+
+#: What `ydotool type` gets right on any common Latin layout. It sends US-layout
+#: keycodes for ASCII and silently drops everything else, so on a Spanish layout
+#: "presentación a:b/c" arrives as "presentacin aÑb-c". Only letters, digits,
+#: whitespace, comma and period sit on the same keys everywhere that matters.
+_LAYOUT_SAFE = frozenset(string.ascii_letters + string.digits + " \t\n,.")
+TEXT_METHODS = ("auto", "paste", "type")
+
+
+def typeable(text: str) -> bool:
+    """True when `ydotool type` reproduces `text` exactly, whatever the layout."""
+    return all(ch in _LAYOUT_SAFE for ch in text)
+
+
+def _sample(chars) -> str:
+    unique = sorted(set(chars))
+    return " ".join(unique[:12]) + (" ..." if len(unique) > 12 else "")
+
+
+def choose_text_method(text: str, method: str = "auto") -> tuple[str, str | None]:
+    """Decide how to enter `text`: ("type" | "paste", warning or None).
+
+    "auto" types plain text (fast path, clipboard untouched) and pastes anything
+    with accents, ñ, symbols or other Unicode. Without wl-clipboard, non-ASCII
+    text is an error rather than silently losing characters; ASCII symbols are
+    typed with a warning, since they are right on a US layout.
+    """
+    if method not in TEXT_METHODS:
+        raise ValueError(f"unknown text method {method!r}")
+    non_ascii = [ch for ch in text if not ch.isascii()]
+    if method == "type":
+        warning = (f"ydotool cannot type these and drops them: {_sample(non_ascii)}"
+                   if non_ascii else None)
+        return "type", warning
+    if method == "paste" or not typeable(text):
+        if clipboard_available():
+            return "paste", None
+        if method == "paste" or non_ascii:
+            raise ClipboardError(
+                f"the text has characters ydotool cannot type ({_sample(non_ascii)}) and "
+                "wl-copy is missing to paste them; install wl-clipboard "
+                "(sudo pacman -S wl-clipboard)" if non_ascii else
+                "wl-copy is missing; install wl-clipboard (sudo pacman -S wl-clipboard)"
+            )
+        odd = [ch for ch in text if ch not in _LAYOUT_SAFE]
+        return "type", (f"typed without wl-clipboard: {_sample(odd)} only come out right "
+                        "on a US keyboard layout")
+    return "type", None
+
+
+def enter_text(text: str, method: str = "auto", delay_ms: int = 0,
+               paste_keys: Sequence[str] = DEFAULT_PASTE_KEYS) -> dict:
+    """Type or paste `text` into the focused widget (see choose_text_method)."""
+    chosen, warning = choose_text_method(text, method)
+    result: dict = {"method": chosen}
+    if chosen == "paste":
+        result["clipboard_restored"] = paste_text(text, keys=paste_keys)
+    else:
+        type_text(text, delay_ms=delay_ms)
+    if warning:
+        result["warning"] = warning
+    return result

@@ -69,7 +69,7 @@ class TestJsonEverywhere:
         mock_type.assert_called_once_with("s3cret", delay_ms=0)
         out = capsys.readouterr().out
         assert "s3cret" not in out
-        assert json.loads(out) == {"ok": True, "action": "type", "chars": 6}
+        assert json.loads(out) == {"ok": True, "action": "type", "chars": 6, "method": "type"}
 
     def test_key_and_click(self, capsys):
         with patch("control.cli.inp.key_combo") as mock_key, \

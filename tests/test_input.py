@@ -106,10 +106,11 @@ class TestInputSerialization:
             depths.append(inp.input_mutex._depth)
             return _completed()
 
-        with patch("control.input.subprocess.run", side_effect=record):
-            inp.drag(0, 0, 10, 10)
-        assert len(depths) == 4  # move, down, move, up
-        assert all(d == 2 for d in depths), "drag must not release between press and release"
+        with patch("control.input.subprocess.run", side_effect=record), \
+             patch("control.input._sleep"):
+            inp.drag(0, 0, 10, 10, steps=3)
+        assert len(depths) == 6  # move, down, 3 moves, up
+        assert all(d >= 2 for d in depths), "drag must not release between press and release"
         assert not inp.input_mutex.held
 
     def test_click_with_coords_is_one_atomic_gesture(self):
@@ -121,7 +122,8 @@ class TestInputSerialization:
 
         with patch("control.input.subprocess.run", side_effect=record):
             inp.click("left", 5, 5)
-        assert depths == [2, 2]  # move + click, both under the same outer hold
+        # move + click, both under the same outer hold (move_mouse nests its own).
+        assert len(depths) == 2 and all(d >= 2 for d in depths)
 
     def test_input_lock_context_manager_covers_several_actions(self):
         depths = []
@@ -169,3 +171,142 @@ class TestInputSerialization:
         with patch("control.input.subprocess.run", return_value=_completed()) as mock_run:
             inp.type_text("hi")
         assert mock_run.call_args[0][0] == ["ydotool", "type", "hi"]
+
+
+class TestDrag:
+    def _calls(self, **kwargs):
+        with patch("control.input.subprocess.run", return_value=_completed()) as mock_run, \
+             patch("control.input._sleep") as mock_sleep:
+            inp.drag(0, 0, 100, 50, **kwargs)
+        return [c[0][0][1:] for c in mock_run.call_args_list], mock_sleep
+
+    def test_glides_in_steps_and_ends_exactly_on_target(self):
+        calls, _ = self._calls(steps=4)
+        assert calls[0] == ["mousemove", "--absolute", "-x", "0", "-y", "0"]
+        assert calls[1] == ["click", "0x40"]
+        moves = [(int(c[3]), int(c[5])) for c in calls[2:-1]]
+        assert moves == [(25, 12), (50, 25), (75, 38), (100, 50)]
+        assert calls[-1] == ["click", "0x80"]
+
+    def test_pauses_after_press_and_before_release(self):
+        _, mock_sleep = self._calls(steps=1, hold_ms=200)
+        assert [c[0][0] for c in mock_sleep.call_args_list] == [0.2, 0.2]
+
+    def test_button_is_released_even_if_a_move_fails(self):
+        issued = []
+
+        def run(args, **_kwargs):
+            issued.append(args[1:])
+            if args[1] == "mousemove" and len(issued) > 2:
+                return _completed(stderr="boom", returncode=1)
+            return _completed()
+
+        with patch("control.input.subprocess.run", side_effect=run), \
+             patch("control.input._sleep"):
+            with pytest.raises(inp.YdotoolError, match="boom"):
+                inp.drag(0, 0, 10, 10, steps=5)
+        assert issued[-1] == ["click", "0x80"]
+        assert not inp.input_mutex.held
+
+
+class TestClipboard:
+    def test_copy_pipes_the_text_into_wl_copy(self):
+        with patch("control.input.shutil.which", return_value="/usr/bin/wl-copy"), \
+             patch("control.input.subprocess.run", return_value=_completed()) as mock_run:
+            inp.copy_to_clipboard("hola", mime="text/plain")
+        args, kwargs = mock_run.call_args
+        assert args[0] == ["/usr/bin/wl-copy", "--type", "text/plain"]
+        assert kwargs["input"] == b"hola"
+        # wl-copy's background child would hold a pipe open forever.
+        assert kwargs["stdout"] is subprocess.DEVNULL
+        assert kwargs["stderr"] is not subprocess.PIPE
+
+    def test_missing_wl_clipboard_is_a_clear_error(self):
+        with patch("control.input.shutil.which", return_value=None):
+            with pytest.raises(inp.ClipboardError, match="wl-clipboard"):
+                inp.copy_to_clipboard("x")
+
+    def test_files_become_a_percent_encoded_uri_list(self, tmp_path):
+        deck = tmp_path / "mi deck.pptx"
+        deck.write_bytes(b"x")
+        with patch("control.input.shutil.which", return_value="/usr/bin/wl-copy"), \
+             patch("control.input.subprocess.run", return_value=_completed()) as mock_run:
+            paths = inp.copy_files([deck])
+        assert paths == [str(deck)]
+        assert mock_run.call_args[0][0][-2:] == ["--type", "text/uri-list"]
+        assert mock_run.call_args[1]["input"] == f"{deck.as_uri()}\r\n".encode()
+        assert "mi%20deck.pptx" in deck.as_uri()
+
+    def test_missing_file_is_refused_before_touching_the_clipboard(self, tmp_path):
+        with patch("control.input.subprocess.run") as mock_run:
+            with pytest.raises(inp.ClipboardError, match="no such file"):
+                inp.copy_files([tmp_path / "nope.pptx"])
+        mock_run.assert_not_called()
+
+    def test_empty_clipboard_reads_as_empty_string(self):
+        with patch("control.input.shutil.which", return_value="/usr/bin/wl-paste"), \
+             patch("control.input.subprocess.run",
+                   return_value=_completed(stdout=b"", stderr=b"No selection", returncode=1)):
+            assert inp.read_clipboard() == ""
+
+
+class FakePointer:
+    """A pointer with libinput-like acceleration, fed by ydotool mousemove calls.
+    Mimics ydotool 1.0: --absolute always lands on 1,1."""
+
+    def __init__(self, width=1920, height=1080):
+        self.x, self.y = 500, 500
+        self.w, self.h = width, height
+        self.calls: list[list[str]] = []
+
+    def run(self, args, **_kwargs):
+        self.calls.append(args[1:])
+        if args[1] == "mousemove":
+            if "--absolute" in args:
+                self.x, self.y = 1, 1
+            else:
+                dx, dy = int(args[args.index("-x") + 1]), int(args[args.index("-y") + 1])
+                gain = 1.0 if max(abs(dx), abs(dy)) <= 16 else 1.9
+                self.x = min(max(0, self.x + round(dx * gain)), self.w - 1)
+                self.y = min(max(0, self.y + round(dy * gain)), self.h - 1)
+        return _completed()
+
+    def position(self):
+        return self.x, self.y
+
+
+class TestPointerPlacement:
+    def _patched(self, pointer):
+        return patch("control.input.subprocess.run", side_effect=pointer.run), \
+               patch("control.input.pointer_position", side_effect=pointer.position)
+
+    def test_move_mouse_corrects_ydotools_absolute_move(self):
+        pointer = FakePointer()
+        run, pos = self._patched(pointer)
+        with run, pos:
+            inp.move_mouse(960, 618)
+        assert pointer.position() == (960, 618)
+        assert len(pointer.calls) < 12
+
+    def test_off_screen_target_is_an_error_not_a_silent_miss(self):
+        pointer = FakePointer()
+        run, pos = self._patched(pointer)
+        with run, pos, pytest.raises(inp.YdotoolError, match="did not reach 5000,10"):
+            inp.move_mouse(5000, 10)
+
+    def test_without_feedback_the_absolute_move_is_all_there_is(self):
+        with patch("control.input.subprocess.run", return_value=_completed()) as mock_run, \
+             patch("control.input.pointer_position", return_value=None):
+            inp.move_mouse(10, 20)
+        assert [c[0][0][1:] for c in mock_run.call_args_list] == [
+            ["mousemove", "--absolute", "-x", "10", "-y", "20"]]
+
+    def test_drag_never_moves_absolutely_while_the_button_is_down(self):
+        pointer = FakePointer()
+        run, pos = self._patched(pointer)
+        with run, pos, patch("control.input._sleep"):
+            inp.drag(100, 100, 400, 250, steps=5)
+        down = pointer.calls.index(["click", "0x40"])
+        up = pointer.calls.index(["click", "0x80"])
+        assert not any("--absolute" in c for c in pointer.calls[down:up])
+        assert pointer.position() == (400, 250)

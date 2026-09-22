@@ -664,6 +664,25 @@ class TestFocusAndGoto:
             ("combo", ("ctrl", "l")), ("type", "https://example.com"), ("key", "enter"),
         ]
 
+    def test_pastes_the_url_when_wl_copy_is_available(self):
+        """ydotool types US keycodes: on a Spanish layout "https://" would come out
+        as "httpsÑ--". Pasting is layout-independent."""
+        class FakeWindow:
+            id, title = "0x1", "Brave"
+
+            def focus(self):
+                return True
+
+        pressed = []
+        with patch("control.input.clipboard_available", return_value=True), \
+             patch("control.input.paste_text", side_effect=lambda t: pressed.append(("paste", t))), \
+             patch("control.input.key_combo", side_effect=lambda *k: pressed.append(("combo", k))), \
+             patch("control.input.type_text", side_effect=AssertionError("must not type")), \
+             patch("control.input.press_key", side_effect=lambda k: pressed.append(("key", k))):
+            assert browser.focus_and_goto(FakeWindow(), "https://example.com/a?b=1") == "paste"
+        assert pressed == [("combo", ("ctrl", "l")), ("paste", "https://example.com/a?b=1"),
+                           ("key", "enter")]
+
     def test_focus_failure_is_a_clear_browser_error(self):
         class FakeWindow:
             id, title = "0x1", "Brave"

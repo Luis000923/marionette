@@ -9,7 +9,7 @@ browser automation. Stdlib + subprocess wrappers around `kdotool`, `ydotool`, an
 ```
 uv sync
 uv run playwright install chromium
-sudo ./scripts/install.sh   # installs ydotool/kdotool, enables ydotoold, group perms
+sudo ./scripts/install.sh   # installs ydotool/kdotool/wl-clipboard, enables ydotoold, group perms
 ```
 
 ## Token efficiency for agents driving this tool
@@ -247,24 +247,115 @@ Then point `control browser` at that port instead of launching a new browser:
 
 ```
 control browser attach --port 9222 --json          # sanity check: lists open tabs
-control browser --cdp-port 9222 goto github.com     # navigates the first existing tab
+control browser --cdp-port 9222 tabs                # * marks the tab in front
+control browser --cdp-port 9222 goto github.com --wait-loaded
+control browser --cdp-port 9222 dom                 # what can I click, and with which selector?
 control browser --cdp-port 9222 click "a.header-search-button"
-control browser --cdp-port 9222 snapshot            # same click/fill/eval/snapshot as always
 ```
 
-`--cdp-port` on the `browser` subcommand applies to `goto`, `click`, `fill`,
-`eval` and `snapshot`: they operate on the already-open browser's first tab
-(creating one if none exists) instead of starting a fresh, isolated Chromium.
+Every `browser` subcommand accepts `--cdp-port`. It acts on **the tab in front**
+(the most recently shown one, as reported by the browser's `/json/list`), not on
+whichever tab Playwright happens to list last. Pick another one with
+`--tab PATTERN` (substring of its URL or title, or its number from `tabs`):
+
+```
+control browser --cdp-port 9222 --tab "Google Slides" snapshot
+control browser --cdp-port 9222 tab gmail --wait-loaded   # also brings it to the front
+```
+
 Closing the command never closes the browser or its tabs — it only disconnects.
-If the debug port isn't reachable (browser not started with
-`--remote-debugging-port`, or wrong port number), the command fails with a clear
-`cannot reach a Chromium debug port at localhost:PORT` error instead of a raw
-Playwright traceback.
+If the debug port isn't reachable, the command fails with a clear
+`cannot reach a Chromium debug port at localhost:PORT` error.
+
+#### Reading the page: `browser dom` and `browser snapshot`
+
+Read the page before acting on it, instead of clicking at guessed coordinates:
+
+```
+control browser --cdp-port 9222 dom                 # interactive elements, one per line
+control browser --cdp-port 9222 dom --root "[role=dialog]"   # only inside a dialog
+control browser --cdp-port 9222 dom --ax            # accessibility tree, straight from CDP
+control browser --cdp-port 9222 snapshot            # plain visible text
+```
+
+`dom` lists links, buttons, inputs, `[role=...]` widgets, contenteditables and
+headings, each with its role, accessible name, a **CSS selector that is unique on
+the page** (ready to pass to `click`/`fill`/`check`) and the center of its box in
+viewport coordinates, flagged `(disabled)`, `(offscreen)` or `(checked)` where it
+applies:
+
+```
+button "Enviar"             button[data-testid="send"]   @640,512
+textbox "Buscar"            input[name="q"]              @186,252
+link "Siguiente" (offscreen) #next                        @43,1480
+```
+
+`--ax` asks Chromium for its accessibility tree (`Accessibility.getFullAXTree`)
+and prunes it to what a screen reader would announce — useful on canvas-heavy or
+heavily componentised apps where the DOM is noise. Both take `--limit N`
+(default 300) and say when they truncated. Password field values are never
+included.
+
+#### Clicking reliably: checks first, then native or JS clicks
+
+`browser click` first checks the target (see `browser check` below), then:
+
+| `--mode` | What happens | Use it for |
+|---|---|---|
+| `auto` (default) | Native click when the element is interactable; otherwise, or if the native click fails, a JS click | almost everything |
+| `native` | Playwright's trusted CDP mouse click at the element's center; fails on hidden/covered targets | sites that reject untrusted events |
+| `js` (or `--js`) | The pointer/mouse event sequence plus `el.click()`, dispatched inside the page | React/Vue listeners that ignore a physical click, targets behind overlays |
+
+The JS click bubbles and is `composed`, so delegated listeners (React attaches
+them to the root) see it; its events have `isTrusted: false`. A disabled element
+is refused in every mode, since clicking it would silently do nothing. The JSON
+result says which `method` was used and, on a fallback, a `note` explaining why.
+
+```
+control browser --cdp-port 9222 check "button.upload"
+# 'button.upload': 1 match(es), <button> 'Subir' at 640,512 -- NOT interactable: it is covered by <div.cookie-banner>
+control browser --cdp-port 9222 click "button.upload" --js
+```
+
+`browser check SELECTOR` reports (as JSON with `--json`) whether the selector
+exists, how many elements match, and whether the first visible match is
+`visible`, `enabled`, `in_viewport` and actually `receives_pointer` at its
+center (`document.elementFromPoint`) — naming the element covering it if not.
+
+#### Waiting until a page is really loaded: `--wait-loaded`
+
+`goto`, `click`, `tab` and `focus-and-goto` take:
+
+- `--wait-loaded`: return only once `document.readyState === "complete"` on the
+  *new* document (the page being left is never mistaken for it: documents are
+  told apart by `performance.timeOrigin`);
+- `--network-idle`: the same, plus no request finishing for 0.5 s (single-page
+  apps that keep fetching after `load`);
+- `--load-timeout S` (default 30).
+
+`control browser wait-loaded [--network-idle]` waits on the current tab without
+doing anything else. A page that doesn't get there in time fails with
+`page_not_loaded` and the last `readyState` seen.
+
+#### Files without the file dialog
+
+```
+control browser --cdp-port 9222 upload "input[type=file]" ~/deck.pptx
+control browser --cdp-port 9222 upload "button.choose-file" ~/deck.pptx   # intercepts the chooser
+control browser --cdp-port 9222 drop "#dropzone" ~/deck.pptx
+```
+
+`browser upload` sets the files on a file input directly (hidden inputs too), or,
+given the button that opens the chooser, intercepts the chooser over CDP and
+answers it — the GTK/KDE dialog never opens. `browser drop` builds a
+`DataTransfer` holding the files' real bytes and dispatches
+`dragenter`/`dragover`/`drop` on the element: no mouse, no file manager, no screen
+coordinates. `handled: true` means the page called `preventDefault()` on the
+drop, which is how drop zones say they took the files (limit: 100 MB in total).
 
 ### Any other browser (Firefox, or Chromium without a debug port): keyboard fallback
 
-No DOM access here — this is a blind "focus the window, then type" fallback,
-useful for a quick navigation when CDP isn't an option:
+A "focus the window, then enter the URL" fallback for when CDP isn't an option:
 
 ```
 control browser focus-and-goto "Brave" "https://example.com"
@@ -272,8 +363,98 @@ control browser focus-and-goto "Firefox" gemini     # site aliases resolve too
 ```
 
 It focuses the first window matching the pattern (via `windows.py`), presses
-Ctrl+L to reach the address bar, types the URL (via `input.py`) and presses
-Enter. No selectors, no return value beyond the window it acted on.
+Ctrl+L, enters the URL and presses Enter. The URL is **pasted** through the
+Wayland clipboard when `wl-copy` is installed, and only typed otherwise:
+`ydotool type` sends US-layout keycodes, so on other layouts `:` and `/` come out
+wrong (a Spanish layout turns `https://` into `httpsÑ--` and the browser searches
+for that). Pasting replaces the clipboard's contents; the JSON result says
+`entered_by: "paste" | "type"`.
+
+If the browser does have a debug port, `focus-and-goto` can also wait for the
+page — it watches the navigation over CDP until the new document is ready:
+
+```
+control browser --cdp-port 9222 focus-and-goto Brave github.com --wait-loaded
+```
+
+## Mouse, drag-and-drop and the clipboard
+
+### Pointer placement
+
+`click -x X -y Y` and `drag` place the pointer in a closed loop: ydotool 1.0's
+`mousemove --absolute` is unreliable on Wayland (it usually leaves the pointer at
+1,1, and relative moves are scaled by pointer acceleration), so after the
+absolute move the real position is read back with `kdotool getmouselocation`
+and corrected until it is exact — typically 3–4 moves, ~40 ms. A target that
+can't be reached (off-screen coordinates) is an error, not a silent miss.
+Coordinates are compositor (logical) pixels, the same space as window geometry.
+
+### Typing text with accents, ñ and symbols
+
+`ydotool type` sends US-layout keycodes for ASCII and silently **drops**
+everything else, so on a Spanish layout `presentación aquí a:b/c` arrives as
+`presentacin aqu aÑb-c`. `control type` therefore picks the method per text:
+
+| Text | `--method auto` (default) does |
+|---|---|
+| only ASCII letters, digits, spaces, newlines, `,` `.` | types it (fast, clipboard untouched) |
+| anything else: `á é í ó ú ñ ü ¿ ¡ € : / @ ( ...`, emoji, CJK | pastes it through the clipboard, byte-exact UTF-8 |
+
+```
+control type "¿Qué tal, señor Núñez?" --window Brave      # pasted
+control type "cd ~/Música" --window kitty                 # pasted with Ctrl+Shift+V
+echo "acción: ñandú" | control type - --window kate       # stdin is read as UTF-8
+control type "p4ssw0rd" --method type --window Brave      # force typing (see below)
+```
+
+- The previous clipboard contents (text or a copied file list) are put back
+  after the paste, and an empty clipboard is emptied again; the JSON result says
+  `clipboard_restored`. A copied image can't be put back (`false`).
+- Terminals (kitty, konsole, alacritty, foot, wezterm, ...) get Ctrl+Shift+V;
+  everything else Ctrl+V. Override with `--paste-keys shift+insert`.
+- Without `wl-clipboard`, text with non-ASCII characters is an error
+  (`clipboard_error`) instead of silently losing letters; ASCII symbols are then
+  typed with a `warning`, since they are only right on a US layout.
+- `--method type` forces typing and warns about the characters that will be
+  dropped. Use it for secrets: a clipboard manager (Klipper) may keep pasted text
+  in its history.
+- Text stays UTF-8 end to end whatever the locale: stdin is decoded from its raw
+  bytes (invalid UTF-8 is an `encoding_error`, a BOM is dropped), arguments
+  mangled by a Latin-1/C locale (`presentaciÃ³n`) are repaired before parsing,
+  stdout is switched to UTF-8, and wl-copy/wl-paste always exchange UTF-8 bytes.
+  `control clip set -` reads stdin the same way.
+
+### `control drag`
+
+```
+control drag --from 300,420 --to 1100,380                      # e.g. Dolphin -> a web page
+control drag --from 300,420 --to 1100,380 --steps 30 --hold 250 --window Dolphin
+```
+
+Presses at `--from`, pauses `--hold` ms (default 150), glides to `--to` in
+`--steps` moves (default 20) so the source sees a real drag start and the drop
+target gets `dragenter`/`dragover`, pauses again, and releases. While the button
+is down only relative moves are sent (an absolute move would drag the item to
+the screen corner first), the whole gesture holds the input lock, and the
+button is released even if a move fails midway. For web drop zones reachable
+over CDP, `browser drop` is more reliable than a physical drag.
+
+### `control clip` (wl-clipboard)
+
+```
+control clip set "some text"                     # copy (the text is never echoed back)
+echo "long text" | control clip set -
+control clip set --file ~/deck.pptx --paste --window Brave   # copy a file, Ctrl+V into Brave
+control clip get                                 # print the clipboard
+control clip get --mime text/uri-list
+```
+
+`--file` (repeatable) copies files the way a file manager does (`text/uri-list`
+with `file://` URIs), which lets a page's paste handler or an upload area take
+them with Ctrl+V instead of going through a file dialog. `--paste` presses
+Ctrl+V right after copying; with `--window` the focus and the paste happen under
+the input lock. Needs `wl-clipboard` (`sudo pacman -S wl-clipboard`; the install
+script adds it).
 
 ## Running several agents in parallel
 

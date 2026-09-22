@@ -15,9 +15,9 @@ else
   REAL_USER="$USER"
 fi
 
-echo "==> Installing ydotool and kdotool"
+echo "==> Installing ydotool, wl-clipboard and kdotool"
 if command -v pacman >/dev/null 2>&1; then
-  pacman -S --needed --noconfirm ydotool
+  pacman -S --needed --noconfirm ydotool wl-clipboard
   if command -v kdotool >/dev/null 2>&1; then
     echo "kdotool already installed, skipping"
   elif pacman -Si kdotool >/dev/null 2>&1; then
@@ -28,7 +28,7 @@ if command -v pacman >/dev/null 2>&1; then
   fi
 elif command -v apt >/dev/null 2>&1; then
   apt update
-  apt install -y ydotool
+  apt install -y ydotool wl-clipboard
   if command -v kdotool >/dev/null 2>&1; then
     echo "kdotool already installed, skipping"
   elif apt-cache show kdotool >/dev/null 2>&1; then
@@ -38,7 +38,7 @@ elif command -v apt >/dev/null 2>&1; then
     echo "  https://github.com/jinliu/kdotool"
   fi
 elif command -v dnf >/dev/null 2>&1; then
-  dnf install -y ydotool
+  dnf install -y ydotool wl-clipboard
   if command -v kdotool >/dev/null 2>&1; then
     echo "kdotool already installed, skipping"
   elif dnf list kdotool >/dev/null 2>&1; then

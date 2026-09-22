@@ -128,15 +128,16 @@ class Window:
         _run("windowsize", self.id, str(width), str(height))
 
     def geometry(self) -> dict[str, int]:
+        """{x, y, width, height} in screen coordinates (empty if kdotool says nothing).
+
+        kdotool prints "Position: X,Y" and "Geometry: WxH" on separate lines.
+        """
         out = _run("getwindowgeometry", self.id)
         geo: dict[str, int] = {}
-        for part in out.replace(",", " ").split():
-            if ":" in part:
-                k, v = part.split(":", 1)
-                try:
-                    geo[k.strip().lower()] = int(v.strip())
-                except ValueError:
-                    pass
+        if m := re.search(r"Position:\s*(-?\d+)\s*,\s*(-?\d+)", out):
+            geo["x"], geo["y"] = int(m.group(1)), int(m.group(2))
+        if m := re.search(r"Geometry:\s*(\d+)\s*x\s*(\d+)", out):
+            geo["width"], geo["height"] = int(m.group(1)), int(m.group(2))
         return geo
 
     def set_state(self, add: list[str] | None = None, remove: list[str] | None = None,

@@ -13,9 +13,13 @@ Logins live in the persistent profile, so they only have to be done once (see
 """
 from __future__ import annotations
 
+import base64
 import json
+import mimetypes
 import os
 import time
+import urllib.request
+import uuid
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
@@ -70,6 +74,23 @@ class SelectorNotFound(BrowserError):
 
 class ResponseTimeout(BrowserError):
     hint = "raise --timeout, or check the page state with: control browser snapshot"
+
+
+class PageNotLoaded(BrowserError):
+    hint = "raise --load-timeout, or check what the page shows with: control browser snapshot"
+
+
+class TabNotFound(BrowserError):
+    hint = "list the open tabs with: control browser --cdp-port PORT tabs"
+
+
+class ElementNotFound(BrowserError):
+    hint = "list the page's clickable elements and their selectors with: control browser dom"
+
+
+class ElementNotInteractable(BrowserError):
+    hint = ("see why with: control browser check SELECTOR; a hidden or covered "
+            "element can still be clicked with --js")
 
 
 # --- AI chat catalog -------------------------------------------------------------
@@ -242,6 +263,7 @@ class Browser:
                 cdp_port: int | None = None):
         self._playwright = sync_playwright().start()
         self.cdp_port = cdp_port
+        self._selected: Optional[Page] = None
         if cdp_port is not None:
             self.profile = None
             try:
@@ -295,7 +317,49 @@ class Browser:
         page.close()
 
     def active_tab(self) -> Optional[Page]:
-        return self.pages[-1] if self.pages else None
+        """The tab commands act on: the one picked with `select_tab`; else, when
+        attached to the user's browser, the tab they are looking at; else the
+        newest one. Playwright's page list is in creation order, which has
+        nothing to do with which tab is in front in Brave/Chrome.
+        """
+        if self._selected is not None and not self._selected.is_closed():
+            return self._selected
+        if not self.pages:
+            return None
+        if self.cdp_port is not None:
+            page = _match_target(self.pages, cdp_targets(self.cdp_port)[:1])
+            if page is not None:
+                return page
+        return self.pages[-1]
+
+    def tabs(self) -> list[dict]:
+        """Every open tab as {index, url, title, active}; `index` works with select_tab."""
+        titles = {}
+        if self.cdp_port is not None:
+            # Titles from the debug endpoint: page.title() would run JS in every
+            # tab, and a tab the browser froze in the background may never answer.
+            titles = {t.get("url"): t.get("title", "") for t in reversed(cdp_targets(self.cdp_port))}
+        active = self.active_tab()
+        return [{"index": i, "url": p.url,
+                 "title": titles[p.url] if p.url in titles else _safe_title(p),
+                 "active": p is active} for i, p in enumerate(self.pages)]
+
+    def select_tab(self, pattern: str) -> Page:
+        """Make later commands act on the tab whose URL or title contains `pattern`
+        (case-insensitive), or on tab number `pattern` from `tabs()`."""
+        tabs = self.tabs()
+        if pattern.isdigit() and int(pattern) < len(tabs):
+            chosen = tabs[int(pattern)]
+        else:
+            needle = pattern.lower()
+            matches = [t for t in tabs if needle in t["url"].lower() or needle in t["title"].lower()]
+            if not matches:
+                raise TabNotFound(f"no open tab matches {pattern!r} "
+                                  f"({len(tabs)} tab(s) open)")
+            # Prefer the tab in front when several match.
+            chosen = next((t for t in matches if t["active"]), matches[0])
+        self._selected = self.pages[chosen["index"]]
+        return self._selected
 
     def goto(self, url: str, page: Optional[Page] = None) -> Page:
         target = page or self.active_tab() or self.new_tab()
@@ -329,6 +393,583 @@ class Browser:
 
     def __exit__(self, *exc) -> None:
         self.close()
+
+
+# --- the attached browser's own view of its tabs -------------------------------------
+
+def cdp_targets(port: int, timeout: float = 2.0) -> list[dict]:
+    """Page targets from the debug endpoint (`/json/list`), most recently focused first.
+
+    Chromium orders this list by last activation, so its first entry is the tab
+    the user is looking at -- something neither Playwright's page list nor any
+    DOM property can tell reliably. Plain urllib: no extra dependency, and an
+    unreachable endpoint just means "don't know" (empty list).
+    """
+    try:
+        with urllib.request.urlopen(f"http://localhost:{port}/json/list", timeout=timeout) as resp:
+            data = json.load(resp)
+    except (OSError, ValueError):
+        return []
+    return [t for t in data if isinstance(t, dict) and t.get("type") == "page"]
+
+
+def _match_target(pages, targets: list[dict]):
+    for target in targets:
+        for page in pages:
+            if page.url == target.get("url"):
+                return page
+    return None
+
+
+def _safe_title(page) -> str:
+    try:
+        return page.title()
+    except Exception:  # noqa: BLE001 - a tab mid-navigation has no title yet
+        return ""
+
+
+# --- page readiness ---------------------------------------------------------------
+# Everything below is written against page.evaluate (plus a few Playwright calls
+# named in each docstring), so it works the same on a launched Chromium and on a
+# CDP-attached Brave, and tests can drive it with fake pages on a fake clock.
+
+LOAD_STATES = ("complete", "networkidle")
+DEFAULT_LOAD_TIMEOUT = 30.0
+#: "networkidle": no new resource finished loading for this long.
+DEFAULT_NETWORK_IDLE = 0.5
+LOAD_POLL_INTERVAL = 0.1
+
+# timeOrigin identifies the document: it changes on every real navigation, so a
+# stale "complete" from the page being left is never mistaken for the new one.
+# The resource-timing buffer defaults to 250 entries; once full the count would
+# freeze and look idle, so it is raised on every probe (idempotent).
+_LOAD_PROBE = """() => {
+  try { performance.setResourceTimingBufferSize(100000); } catch (e) {}
+  return {state: document.readyState, url: location.href, origin: performance.timeOrigin,
+          resources: performance.getEntriesByType('resource').length};
+}"""
+
+
+def _probe(page) -> dict | None:
+    try:
+        return page.evaluate(_LOAD_PROBE)
+    except Exception:  # noqa: BLE001 - the old document is being torn down mid-navigation
+        return None
+
+
+def wait_loaded(page, state: str = "complete", timeout: float = DEFAULT_LOAD_TIMEOUT,
+                idle: float = DEFAULT_NETWORK_IDLE) -> dict:
+    """Block until the page's `document.readyState` is "complete" -- and, for
+    `state="networkidle"`, until no new resource has finished for `idle` seconds
+    (catches SPAs that keep fetching after the load event). Raises PageNotLoaded.
+    """
+    if state not in LOAD_STATES:
+        raise BrowserError(f"unknown load state {state!r}", hint=f"use one of: {', '.join(LOAD_STATES)}")
+    started = _now()
+    deadline = started + timeout
+    count, quiet_since, probe = None, None, None
+    while True:
+        now = _now()
+        probe = _probe(page)
+        if probe and probe.get("state") == "complete":
+            if state == "complete":
+                break
+            if probe.get("resources") != count:
+                count, quiet_since = probe.get("resources"), now
+            elif now - quiet_since >= idle:
+                break
+        else:
+            count = quiet_since = None
+        if now >= deadline:
+            seen = probe.get("state") if probe else "unreachable"
+            raise PageNotLoaded(f"{page.url} not {state} after {timeout:g}s (readyState: {seen})")
+        _sleep(LOAD_POLL_INTERVAL)
+    return {"state": state, "ready_state": "complete", "url": probe.get("url", page.url),
+            "waited": round(_now() - started, 2)}
+
+
+def document_id(page) -> float | None:
+    """Which document the tab shows right now (see _LOAD_PROBE); None if unknown."""
+    return (_probe(page) or {}).get("origin")
+
+
+def document_ids(pages) -> dict[int, float | None]:
+    return {id(p): document_id(p) for p in pages}
+
+
+def _same_site(a: str, b: str) -> bool:
+    """example.com vs www.example.com vs m.example.com count as the same site:
+    typed URLs routinely redirect to a sibling host."""
+    a, b = a.removeprefix("www."), b.removeprefix("www.")
+    return bool(a) and (a == b or a.endswith("." + b) or b.endswith("." + a))
+
+
+def wait_for_navigation(browser: "Browser", url: str, before: dict[int, float | None],
+                        state: str = "complete", timeout: float = DEFAULT_LOAD_TIMEOUT):
+    """After a navigation started outside Playwright (keyboard, a click), find the tab
+    that loaded a *new* document on `url`'s host, and wait until it's loaded.
+
+    `before` comes from document_ids() taken before the navigation started.
+    Returns (page, wait_loaded() result). Raises PageNotLoaded.
+    """
+    host = _host(url)
+    started = _now()
+    deadline = started + timeout
+    while True:
+        # Probing every tab also keeps Playwright's event loop turning, which is
+        # what updates page.url and adds tabs opened since we connected.
+        for page in list(browser.pages):
+            probe = _probe(page)
+            if not probe or not _same_site(_host(probe.get("url", "")), host):
+                continue
+            if before.get(id(page)) != probe.get("origin"):
+                result = wait_loaded(page, state, timeout=max(0.0, deadline - _now()))
+                result["waited"] = round(_now() - started, 2)
+                return page, result
+        if _now() >= deadline:
+            raise PageNotLoaded(
+                f"no tab loaded {url} within {timeout:g}s",
+                hint="the keystrokes may have gone to another window; check with: "
+                     "control browser --cdp-port PORT tabs",
+            )
+        _sleep(LOAD_POLL_INTERVAL)
+
+
+def await_navigation_start(page, before_origin: float | None, grace: float = 1.0) -> None:
+    """Give an action up to `grace` seconds to start a navigation.
+
+    Right after a click, the page being left still says "complete"; waiting for
+    readiness straight away would return before the new page even started.
+    Returns as soon as a new document shows up or the old one leaves "complete";
+    an action that doesn't navigate (an SPA button) just costs the grace period.
+    """
+    deadline = _now() + grace
+    while _now() < deadline:
+        probe = _probe(page)
+        if probe is None or probe.get("origin") != before_origin or probe.get("state") != "complete":
+            return
+        _sleep(LOAD_POLL_INTERVAL)
+
+
+# --- reading the page: interactive elements and the accessibility tree ---------------
+
+DEFAULT_DOM_LIMIT = 300
+
+_DOM_OUTLINE = r"""(opts) => {
+  const INTERACTIVE = 'a[href],button,input:not([type=hidden]),select,textarea,summary,' +
+    '[role=button],[role=link],[role=tab],[role=menuitem],[role=menuitemcheckbox],' +
+    '[role=menuitemradio],[role=checkbox],[role=radio],[role=switch],[role=option],' +
+    '[role=combobox],[role=textbox],[role=searchbox],[role=slider],[contenteditable=""],' +
+    '[contenteditable=true],[onclick],[tabindex]:not([tabindex="-1"])';
+  const STRUCTURE = 'h1,h2,h3,h4,h5,h6,[role=heading],[role=dialog],[role=alertdialog],[role=alert]';
+  const root = opts.root ? document.querySelector(opts.root) : document.body;
+  if (!root) return {missing_root: true};
+  const clean = (s) => (s || '').replace(/\s+/g, ' ').trim().slice(0, opts.max_text);
+  const unique = (sel) => { try { return document.querySelectorAll(sel).length === 1; } catch (e) { return false; } };
+  const selectorFor = (el) => {
+    const tag = el.tagName.toLowerCase();
+    if (el.id && unique('#' + CSS.escape(el.id))) return '#' + CSS.escape(el.id);
+    for (const attr of ['data-testid', 'data-test', 'data-qa', 'name', 'aria-label',
+                        'placeholder', 'title', 'alt', 'href', 'type']) {
+      const v = el.getAttribute(attr);
+      if (v && v.length < 120) {
+        const sel = tag + '[' + attr + '=' + JSON.stringify(v) + ']';
+        if (unique(sel)) return sel;
+      }
+    }
+    const parts = [];
+    for (let node = el; node && node.nodeType === 1 && node !== document.documentElement;
+         node = node.parentElement) {
+      if (node !== el && node.id && unique('#' + CSS.escape(node.id))) {
+        parts.unshift('#' + CSS.escape(node.id));
+        break;
+      }
+      const t = node.tagName.toLowerCase();
+      const parent = node.parentElement;
+      const same = parent ? Array.from(parent.children).filter(c => c.tagName === node.tagName) : [];
+      parts.unshift(same.length > 1 ? t + ':nth-of-type(' + (same.indexOf(node) + 1) + ')' : t);
+    }
+    return parts.join(' > ');
+  };
+  const IMPLICIT = {a: 'link', button: 'button', select: 'combobox', textarea: 'textbox',
+                    summary: 'button', h1: 'heading', h2: 'heading', h3: 'heading',
+                    h4: 'heading', h5: 'heading', h6: 'heading'};
+  const INPUT_ROLES = {checkbox: 'checkbox', radio: 'radio', button: 'button', submit: 'button',
+                       reset: 'button', image: 'button', range: 'slider', file: 'file',
+                       search: 'searchbox'};
+  const roleOf = (el) => {
+    const tag = el.tagName.toLowerCase();
+    if (el.getAttribute('role')) return el.getAttribute('role');
+    if (tag === 'input') return INPUT_ROLES[(el.type || '').toLowerCase()] || 'textbox';
+    if (el.isContentEditable) return 'textbox';
+    return IMPLICIT[tag] || tag;
+  };
+  const nameOf = (el) => {
+    const label = el.labels && el.labels.length ? el.labels[0].innerText : '';
+    const byId = (el.getAttribute('aria-labelledby') || '').split(/\s+/)
+      .map(id => document.getElementById(id)).filter(Boolean).map(n => n.innerText).join(' ');
+    const ownValue = el.tagName === 'INPUT' && ['button', 'submit', 'reset'].includes(el.type) ? el.value : '';
+    return clean(el.getAttribute('aria-label') || byId || label || el.innerText || ownValue ||
+                 el.getAttribute('placeholder') || el.getAttribute('title') || el.getAttribute('alt') || '');
+  };
+  const shown = (el, r) => {
+    if (r.width === 0 || r.height === 0) return false;
+    const cs = getComputedStyle(el);
+    return cs.visibility !== 'hidden' && cs.display !== 'none' && parseFloat(cs.opacity || '1') > 0;
+  };
+  const out = [];
+  let total = 0;
+  for (const el of root.querySelectorAll(INTERACTIVE + ',' + STRUCTURE)) {
+    const r = el.getBoundingClientRect();
+    const visible = shown(el, r);
+    if (!visible && !opts.all) continue;
+    total++;
+    if (out.length >= opts.limit) continue;
+    const item = {role: roleOf(el), name: nameOf(el), tag: el.tagName.toLowerCase(),
+                  selector: selectorFor(el),
+                  box: {x: Math.round(r.left), y: Math.round(r.top),
+                        width: Math.round(r.width), height: Math.round(r.height)},
+                  in_viewport: r.bottom > 0 && r.right > 0 && r.top < innerHeight && r.left < innerWidth};
+    if (!visible) item.hidden = true;
+    if (el.disabled || el.getAttribute('aria-disabled') === 'true') item.disabled = true;
+    if ('checked' in el && ['checkbox', 'radio'].includes(el.type)) item.checked = el.checked;
+    // Never echo a password field's contents back to the agent.
+    if ('value' in el && el.type !== 'password' && typeof el.value === 'string' && el.value &&
+        !['button', 'submit', 'reset'].includes(el.type)) item.value = clean(el.value);
+    if (el.tagName === 'A') item.href = el.getAttribute('href');
+    out.push(item);
+  }
+  return {url: location.href, title: document.title, total: total, elements: out,
+          truncated: total > out.length,
+          viewport: {width: innerWidth, height: innerHeight, scroll_y: Math.round(scrollY)}};
+}"""
+
+
+def dom_outline(page, root: str | None = None, limit: int = DEFAULT_DOM_LIMIT,
+                include_hidden: bool = False, max_text: int = 80) -> dict:
+    """The page's interactive elements (and headings/dialogs for orientation), each
+    with a role, an accessible-ish name, a CSS selector that is unique on the page,
+    and its box in viewport coordinates. Meant to be read before clicking, so the
+    agent picks a selector instead of guessing coordinates."""
+    data = page.evaluate(_DOM_OUTLINE, {"root": root, "limit": limit, "all": include_hidden,
+                                        "max_text": max_text})
+    if data.get("missing_root"):
+        raise ElementNotFound(f"no element matches {root!r} on {page.url}")
+    return data
+
+
+#: Roles that add nesting but no meaning; their children are kept, one level up.
+_AX_NOISE = {"generic", "none", "presentation", "group", "Section"}
+#: Layout fragments that only repeat their parent's text: always dropped.
+_AX_FRAGMENTS = {"InlineTextBox", "LineBreak"}
+_AX_PROPS = ("focused", "disabled", "checked", "expanded", "selected", "pressed", "required",
+             "invalid", "level", "url")
+
+
+def _ax_value(field) -> str:
+    if isinstance(field, dict):
+        value = field.get("value")
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        return "" if value is None else str(value)
+    return ""
+
+
+def flatten_ax(nodes: list[dict], limit: int = DEFAULT_DOM_LIMIT) -> dict:
+    """Turn CDP `Accessibility.getFullAXTree` nodes into a compact, indented list.
+
+    Ignored nodes and anonymous wrappers are dropped (their children move up),
+    and a text node repeating its parent's name is dropped too: what is left is
+    roughly what a screen reader would announce.
+    """
+    by_id = {n.get("nodeId"): n for n in nodes}
+    roots = [n for n in nodes if n.get("parentId") not in by_id]
+    out: list[dict] = []
+    total = 0
+    # Iterative DFS: real pages nest far deeper than Python's recursion limit likes.
+    stack = [(n, 0, "") for n in reversed(roots)]
+    while stack:
+        node, depth, parent_name = stack.pop()
+        role = _ax_value(node.get("role"))
+        name = " ".join(_ax_value(node.get("name")).split())
+        keep = (not node.get("ignored") and role not in _AX_FRAGMENTS
+                and (role not in _AX_NOISE or name))
+        if role == "StaticText" and (not name or name == parent_name):
+            keep = False
+        child_depth = depth
+        if keep:
+            total += 1
+            if len(out) < limit:
+                item: dict = {"depth": depth, "role": role, "name": name}
+                value = _ax_value(node.get("value"))
+                if value and role != "StaticText":
+                    item["value"] = value
+                for prop in node.get("properties", []):
+                    if prop.get("name") in _AX_PROPS:
+                        pv = _ax_value(prop.get("value"))
+                        if pv and pv != "false":
+                            item[prop["name"]] = pv
+                out.append(item)
+            child_depth = depth + 1
+            parent_name = name or parent_name
+        children = [by_id[c] for c in node.get("childIds", []) if c in by_id]
+        stack.extend((c, child_depth, parent_name) for c in reversed(children))
+    return {"nodes": out, "total": total, "truncated": total > len(out)}
+
+
+def accessibility_tree(page, limit: int = DEFAULT_DOM_LIMIT) -> dict:
+    """The tab's accessibility tree, straight from CDP (Accessibility.getFullAXTree)."""
+    session = page.context.new_cdp_session(page)
+    try:
+        nodes = session.send("Accessibility.getFullAXTree").get("nodes", [])
+    finally:
+        try:
+            session.detach()
+        except Exception:  # noqa: BLE001 - the tab may have gone away meanwhile
+            pass
+    data = flatten_ax(nodes, limit)
+    data["url"] = page.url
+    return data
+
+
+# --- checking and clicking elements ---------------------------------------------------
+
+DEFAULT_ACTION_TIMEOUT = 5.0
+CLICK_MODES = ("auto", "native", "js")
+_MARK = "data-control-target"
+
+# Picks the first *visible* match (falling back to the first match), reports why
+# it could or couldn't take a click, and optionally tags it so the follow-up
+# action hits exactly this element even when the selector matches several.
+_CHECK = r"""(opts) => {
+  let list;
+  try { list = document.querySelectorAll(opts.selector); }
+  catch (e) { return {selector: opts.selector, invalid: String(e.message || e)}; }
+  const out = {selector: opts.selector, count: list.length, exists: list.length > 0};
+  if (!list.length) return out;
+  const hasBox = (e) => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+  const el = Array.from(list).find(hasBox) || list[0];
+  if (opts.scroll) el.scrollIntoView({block: 'center', inline: 'center'});
+  if (opts.mark) el.setAttribute(opts.mark_attr, opts.mark);
+  const r = el.getBoundingClientRect();
+  const cs = getComputedStyle(el);
+  const describe = (n) => n.tagName.toLowerCase() + (n.id ? '#' + n.id : '') +
+    (typeof n.className === 'string' && n.className.trim() ? '.' + n.className.trim().split(/\s+/).slice(0, 3).join('.') : '');
+  out.tag = el.tagName.toLowerCase();
+  if (el.type) out.type = String(el.type).toLowerCase();
+  out.text = (el.innerText || el.value || el.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim().slice(0, 80);
+  out.visible = r.width > 0 && r.height > 0 && cs.visibility !== 'hidden' && cs.display !== 'none' &&
+                parseFloat(cs.opacity || '1') > 0;
+  out.enabled = !el.disabled && el.getAttribute('aria-disabled') !== 'true' && !el.closest('fieldset[disabled]');
+  out.editable = !el.readOnly && (el.isContentEditable || ['INPUT', 'TEXTAREA', 'SELECT'].includes(el.tagName));
+  out.box = {x: Math.round(r.left), y: Math.round(r.top), width: Math.round(r.width), height: Math.round(r.height)};
+  const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+  out.center = {x: Math.round(cx), y: Math.round(cy)};
+  out.in_viewport = cx >= 0 && cy >= 0 && cx < innerWidth && cy < innerHeight;
+  out.receives_pointer = false;
+  if (out.visible && out.in_viewport && cs.pointerEvents !== 'none') {
+    const hit = document.elementFromPoint(cx, cy);
+    out.receives_pointer = !!hit && (hit === el || el.contains(hit) || (el.shadowRoot && el.shadowRoot.contains(hit)));
+    if (hit && !out.receives_pointer) out.covered_by = describe(hit);
+  }
+  out.interactable = out.visible && out.enabled && out.receives_pointer;
+  return out;
+}"""
+
+_UNMARK = """(opts) => document.querySelectorAll('[' + opts.attr + '="' + opts.mark + '"]')
+  .forEach(e => e.removeAttribute(opts.attr))"""
+
+# The full sequence a real mouse click produces, then el.click() for the click
+# itself (and its default action: following a link, toggling a checkbox,
+# submitting a form). Events bubble and are composed, so React/Vue's delegated
+# listeners on the root see them like any user click.
+_JS_CLICK = r"""(opts) => {
+  const el = document.querySelector(opts.selector);
+  if (!el) return false;
+  el.scrollIntoView({block: 'center', inline: 'center'});
+  const r = el.getBoundingClientRect();
+  const base = {bubbles: true, cancelable: true, composed: true, view: window,
+                clientX: r.left + r.width / 2, clientY: r.top + r.height / 2, button: 0};
+  const pointer = Object.assign({pointerId: 1, pointerType: 'mouse', isPrimary: true}, base);
+  const Pointer = window.PointerEvent || MouseEvent;
+  el.dispatchEvent(new Pointer('pointerover', pointer));
+  el.dispatchEvent(new MouseEvent('mouseover', base));
+  el.dispatchEvent(new Pointer('pointerdown', Object.assign({buttons: 1}, pointer)));
+  el.dispatchEvent(new MouseEvent('mousedown', Object.assign({buttons: 1}, base)));
+  if (typeof el.focus === 'function') el.focus({preventScroll: true});
+  el.dispatchEvent(new Pointer('pointerup', pointer));
+  el.dispatchEvent(new MouseEvent('mouseup', base));
+  el.click();
+  return true;
+}"""
+
+
+def check_element(page, selector: str, scroll: bool = False, mark: str | None = None) -> dict:
+    """Whether `selector` exists and could take a real click right now: visible,
+    enabled, inside the viewport, and not covered by another element (an overlay,
+    a cookie banner, a spinner). Never raises for a missing element -- check
+    `exists`; an invalid selector raises ElementNotFound."""
+    state = page.evaluate(_CHECK, {"selector": selector, "scroll": scroll,
+                                   "mark": mark, "mark_attr": _MARK})
+    if state.get("invalid"):
+        raise ElementNotFound(f"invalid CSS selector {selector!r}: {state['invalid']}",
+                              hint="check the selector syntax; list valid ones with: control browser dom")
+    return state
+
+
+def _why_not(state: dict) -> str:
+    if not state.get("visible"):
+        return "it is hidden (zero size, display:none, visibility:hidden or opacity 0)"
+    if not state.get("enabled"):
+        return "it is disabled"
+    if not state.get("in_viewport"):
+        return "it is outside the viewport"
+    if state.get("covered_by"):
+        return f"it is covered by <{state['covered_by']}>"
+    return "it does not receive pointer events"
+
+
+def _require(page, selector: str, scroll: bool = False, mark: str | None = None) -> dict:
+    state = check_element(page, selector, scroll=scroll, mark=mark)
+    if not state["exists"]:
+        raise ElementNotFound(f"no element matches {selector!r} on {page.url}")
+    return state
+
+
+def click_element(page, selector: str, mode: str = "auto",
+                  timeout: float = DEFAULT_ACTION_TIMEOUT) -> dict:
+    """Click `selector` after checking it can be clicked.
+
+    Modes:
+    * "native": Playwright's click -- trusted CDP mouse events at the element's
+      center, after its own actionability checks. Fails on hidden/covered elements.
+    * "js": dispatch the pointer/mouse sequence and call `el.click()` in the page.
+      Reaches hidden or covered elements; events are untrusted (`isTrusted` false),
+      which a few sites reject.
+    * "auto" (default): native when the element is interactable, otherwise -- or
+      if the native click fails -- fall back to the JS click.
+
+    A disabled element is refused in every mode: el.click() on it is a no-op, and
+    reporting success for a click that did nothing would mislead the agent.
+    """
+    if mode not in CLICK_MODES:
+        raise BrowserError(f"unknown click mode {mode!r}", hint=f"use one of: {', '.join(CLICK_MODES)}")
+    mark = uuid.uuid4().hex[:12]
+    target = f'[{_MARK}="{mark}"]'
+    state = _require(page, selector, scroll=True, mark=mark)
+    result = {"selector": selector, "matches": state["count"], "target": state}
+    try:
+        if not state["enabled"]:
+            raise ElementNotInteractable(f"cannot click {selector!r}: {_why_not(state)}",
+                                         hint="wait for the page to enable it, e.g. after filling "
+                                              "required fields; inspect with: control browser check")
+        if mode == "native" and not state["interactable"]:
+            raise ElementNotInteractable(f"cannot click {selector!r} natively: {_why_not(state)}")
+        if mode == "js" or not state["interactable"]:
+            if mode == "auto":
+                result["note"] = f"native click impossible ({_why_not(state)}); used a JS click"
+            page.evaluate(_JS_CLICK, {"selector": target})
+            result["method"] = "js"
+            return result
+        try:
+            page.click(target, timeout=timeout * 1000)
+            result["method"] = "native"
+        except Exception as exc:  # noqa: BLE001 - reported in the result, not swallowed
+            if mode == "native":
+                raise
+            page.evaluate(_JS_CLICK, {"selector": target})
+            result["method"] = "js"
+            result["note"] = f"native click failed ({str(exc).splitlines()[0]}); used a JS click"
+        return result
+    finally:
+        try:
+            page.evaluate(_UNMARK, {"attr": _MARK, "mark": mark})
+        except Exception:  # noqa: BLE001 - the click navigated away: nothing left to clean
+            pass
+
+
+# --- files: upload through an input/file chooser, or drop onto a drop zone ----------------
+
+#: Dropped files travel through page.evaluate as base64; keep that sane.
+MAX_DROP_BYTES = 100 * 1024 * 1024
+
+
+def _local_files(files) -> list[Path]:
+    paths = [Path(f).expanduser().resolve() for f in files]
+    missing = [str(p) for p in paths if not p.is_file()]
+    if missing:
+        raise BrowserError(f"no such file: {', '.join(missing)}", hint="check the file path(s)")
+    return paths
+
+
+def upload_files(page, selector: str, files, timeout: float = DEFAULT_ACTION_TIMEOUT) -> dict:
+    """Hand files to a page without its native file dialog ever opening.
+
+    `selector` may be the `<input type=file>` itself (hidden ones included), or
+    the button that opens the chooser: then the chooser is intercepted over CDP
+    (page.expect_file_chooser) and answered with the files.
+    """
+    paths = _local_files(files)
+    state = _require(page, selector)
+    if state.get("tag") == "input" and state.get("type") == "file":
+        page.set_input_files(selector, [str(p) for p in paths], timeout=timeout * 1000)
+        method = "input"
+    else:
+        with page.expect_file_chooser(timeout=timeout * 1000) as chooser:
+            click_element(page, selector, timeout=timeout)
+        chooser.value.set_files([str(p) for p in paths])
+        method = "file_chooser"
+    return {"selector": selector, "method": method, "files": [str(p) for p in paths]}
+
+
+_DROP = r"""(opts) => {
+  const el = document.querySelector(opts.selector);
+  if (!el) return null;
+  const dt = new DataTransfer();
+  for (const f of opts.files) {
+    const bytes = Uint8Array.from(atob(f.data), c => c.charCodeAt(0));
+    dt.items.add(new File([bytes], f.name, {type: f.type}));
+  }
+  el.scrollIntoView({block: 'center', inline: 'center'});
+  const r = el.getBoundingClientRect();
+  const init = {bubbles: true, cancelable: true, composed: true, dataTransfer: dt,
+                clientX: r.left + r.width / 2, clientY: r.top + r.height / 2};
+  const events = {};
+  for (const type of ['dragenter', 'dragover', 'drop']) {
+    const ev = new DragEvent(type, init);
+    el.dispatchEvent(ev);
+    events[type] = ev.defaultPrevented;
+  }
+  return events;
+}"""
+
+
+def drop_files(page, selector: str, files) -> dict:
+    """Drop local files onto a drag-and-drop zone, entirely inside the page.
+
+    Builds a DataTransfer with the files' real bytes and dispatches
+    dragenter/dragover/drop on the element -- no mouse, no file manager, no
+    screen coordinates. `handled` is true when the page called preventDefault()
+    on the drop, which is what drop zones do when they take the files.
+    """
+    paths = _local_files(files)
+    size = sum(p.stat().st_size for p in paths)
+    if size > MAX_DROP_BYTES:
+        raise BrowserError(f"{size} bytes is too much to drop through the page",
+                           hint="use 'control browser upload' with the page's file input instead")
+    mark = uuid.uuid4().hex[:12]
+    _require(page, selector, mark=mark)
+    payload = [{"name": p.name, "type": mimetypes.guess_type(p.name)[0] or "application/octet-stream",
+                "data": base64.b64encode(p.read_bytes()).decode()} for p in paths]
+    try:
+        events = page.evaluate(_DROP, {"selector": f'[{_MARK}="{mark}"]', "files": payload})
+    finally:
+        try:
+            page.evaluate(_UNMARK, {"attr": _MARK, "mark": mark})
+        except Exception:  # noqa: BLE001
+            pass
+    return {"selector": selector, "files": [str(p) for p in paths], "bytes": size,
+            "handled": bool(events and events.get("drop")), "events": events}
 
 
 # --- asking an AI site -------------------------------------------------------------
@@ -509,13 +1150,19 @@ def ask(browser: "Browser", site_name: str, question: str,
 
 # --- keyboard fallback, for browsers with no CDP/DOM access (e.g. Firefox) -----
 
-def focus_and_goto(window: "windows.Window", url: str) -> None:
+def focus_and_goto(window: "windows.Window", url: str) -> str:
     """Navigate a browser window to `url` by focusing it and typing, not the DOM.
 
     The only way in when the browser wasn't opened with a debug port: focus the
-    window (`windows.py`), press Ctrl+L to reach the address bar, type the URL
+    window (`windows.py`), press Ctrl+L to reach the address bar, enter the URL
     and press Enter (`input.py`). Works on any browser, but is blind -- no
-    selectors, no return value beyond "the keys were sent".
+    selectors, no return value beyond how the URL was entered.
+
+    The URL is pasted from the Wayland clipboard when wl-copy is available:
+    `ydotool type` sends US-layout keycodes, so on any other layout ':' and '/'
+    come out as other characters (on a Spanish one, "https://" turns into
+    "httpsÑ--" and the browser searches for it). Pasting replaces the user's
+    clipboard contents. Returns "paste" or "type".
     """
     from . import input as inp
 
@@ -525,10 +1172,16 @@ def focus_and_goto(window: "windows.Window", url: str) -> None:
             hint="KWin focus-stealing prevention may be blocking it; "
                  "try 'control win activate' first",
         )
+    # URLs always hold ':' and '/', so this pastes whenever wl-copy exists.
+    method, _warning = inp.choose_text_method(url)
     with inp.input_lock():
         inp.key_combo("ctrl", "l")
-        inp.type_text(url)
+        if method == "paste":
+            inp.paste_text(url)
+        else:
+            inp.type_text(url)
         inp.press_key("enter")
+    return method
 
 
 def wait_for_login(browser: "Browser", site_name: str, timeout: float = 300.0) -> str:

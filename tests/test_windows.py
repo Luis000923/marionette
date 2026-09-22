@@ -412,3 +412,10 @@ class TestResolveDesktop:
              patch("control.windows.create_desktop", return_value=created) as mock_create:
             assert windows.resolve_desktop("agent_7", create=True) is created
         mock_create.assert_called_once_with("agent_7")
+
+
+def test_geometry_parses_kdotool_output():
+    out = "Window {96a3}\n  Position: 332,-14\n  Geometry: 1256x809\n"
+    with patch("control.windows.subprocess.run", return_value=_completed(stdout=out)):
+        geo = windows.Window("{96a3}").geometry()
+    assert geo == {"x": 332, "y": -14, "width": 1256, "height": 809}

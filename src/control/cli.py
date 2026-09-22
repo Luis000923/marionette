@@ -67,6 +67,64 @@ def _json_requested(argv: list[str] | None = None) -> bool:
     return "--json" in argv or _truthy(os.environ.get("CONTROL_JSON"))
 
 
+# --- text encoding: UTF-8 end to end, whatever the locale -------------------------
+
+def _is_utf8(encoding: str | None) -> bool:
+    return (encoding or "").lower().replace("-", "").replace("_", "") == "utf8"
+
+
+def utf8_arg(value: str) -> str:
+    """Undo a non-UTF-8 decoding of a command-line argument.
+
+    Python decodes argv with the filesystem encoding. Under a Latin-1 locale the
+    UTF-8 bytes of "ó" become "Ã³"; under a strict one, undecodable bytes become
+    lone surrogates that can't even be encoded again. Re-encoding with the same
+    codec recovers the original bytes, which are then decoded as UTF-8 (the
+    encoding of every terminal and of Wayland). Arguments that really were in
+    another encoding are left alone.
+    """
+    has_surrogates = any("\udc80" <= ch <= "\udcff" for ch in value)
+    if _is_utf8(sys.getfilesystemencoding()) and not has_surrogates:
+        return value
+    try:
+        raw = value.encode(sys.getfilesystemencoding(), sys.getfilesystemencodeerrors())
+    except (UnicodeEncodeError, LookupError):
+        return value
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return raw.decode("utf-8", errors="replace") if has_surrogates else value
+
+
+def read_stdin_text() -> str:
+    """All of stdin as UTF-8 text, decoded from the raw bytes (a BOM is dropped).
+
+    sys.stdin.read() would decode with the locale's encoding; a C or Latin-1
+    locale then mangles every accent before the text ever reaches ydotool.
+    """
+    buffer = getattr(sys.stdin, "buffer", None)
+    if buffer is None:  # already text (e.g. replaced by a StringIO)
+        return sys.stdin.read()
+    data = buffer.read()
+    try:
+        return data.decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        raise CliError(f"stdin is not valid UTF-8 (byte {exc.start}: {data[exc.start:exc.start + 4]!r})",
+                       hint="convert it first, e.g.: iconv -f latin1 -t utf-8 file | control ...",
+                       kind="encoding_error") from exc
+
+
+def _text_arg(value: str) -> str:
+    return read_stdin_text() if value == "-" else value
+
+
+def _utf8_stdio() -> None:
+    """Print accents as themselves instead of crashing on an ASCII/Latin-1 stdout."""
+    for stream in (sys.stdout, sys.stderr):
+        if not _is_utf8(getattr(stream, "encoding", "utf-8")) and hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
+
+
 def _json_mode(args: argparse.Namespace) -> bool:
     # `is True`: a mocked namespace must not count as JSON mode.
     return getattr(args, "json", False) is True or _truthy(os.environ.get("CONTROL_JSON"))
@@ -288,13 +346,38 @@ def _cmd_click(args: argparse.Namespace) -> Out:
                           button=args.button, x=args.x, y=args.y)
 
 
+def _paste_keys(args: argparse.Namespace) -> tuple[str, ...]:
+    """--paste-keys if given, else Ctrl+Shift+V for terminals and Ctrl+V elsewhere.
+    Called after --window took focus, so the active window is the target."""
+    if getattr(args, "paste_keys", None):
+        return tuple(k.strip().lower() for k in args.paste_keys.split("+"))
+    try:
+        return inp.paste_keys_for(windows.active_window().classname)
+    except Exception:  # noqa: BLE001 - no KWin answer: the common case is not a terminal
+        return inp.DEFAULT_PASTE_KEYS
+
+
 @command
 def _cmd_type(args: argparse.Namespace) -> Out:
-    text = sys.stdin.read() if args.text == "-" else args.text
+    text = _text_arg(args.text)
+    # Decided (and wl-clipboard checked) before focusing anything.
+    method, warning = inp.choose_text_method(text, args.method)
+    result: dict[str, Any] = {}
+
+    def send() -> None:
+        if method == "paste":
+            result["clipboard_restored"] = inp.paste_text(text, keys=_paste_keys(args))
+        else:
+            inp.type_text(text, delay_ms=args.delay)
+
     # Only the length is echoed back: the text may be a password, and repeating
     # it would cost the agent tokens for nothing.
-    return _focused_input(args, "type", lambda: inp.type_text(text, delay_ms=args.delay),
-                          chars=len(text))
+    out = _focused_input(args, "type", send, chars=len(text), method=method)
+    out.data.update(result)
+    if warning:
+        out.data["warning"] = warning
+        print(f"[WARN] {warning}", file=sys.stderr)
+    return out
 
 
 @command
@@ -309,6 +392,53 @@ def _cmd_key(args: argparse.Namespace) -> Out:
             kind="unknown_key",
         )
     return _focused_input(args, "key", lambda: inp.key_combo(*args.keys), keys=args.keys)
+
+
+def _point(value: str) -> tuple[int, int]:
+    try:
+        x, y = (int(v) for v in value.split(","))
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected X,Y (e.g. 640,480), got {value!r}") from None
+    return x, y
+
+
+@command
+def _cmd_drag(args: argparse.Namespace) -> Out:
+    (x1, y1), (x2, y2) = args.start, args.end
+    return _focused_input(
+        args, "drag",
+        lambda: inp.drag(x1, y1, x2, y2, args.button, steps=args.steps, hold_ms=args.hold),
+        start=[x1, y1], end=[x2, y2], button=args.button, steps=args.steps,
+    )
+
+
+@command
+def _cmd_clip_set(args: argparse.Namespace) -> Out:
+    if bool(args.files) == (args.text is not None):
+        raise CliError("pass either TEXT (or '-' for stdin) or --file PATH...",
+                       hint="e.g. control clip set --file ~/deck.pptx --paste --window Brave",
+                       kind="usage_error")
+    if args.files:
+        fields: dict[str, Any] = {"files": inp.copy_files(args.files), "mime": "text/uri-list"}
+        text = f"copied {len(fields['files'])} file(s)"
+    else:
+        content = _text_arg(args.text)
+        inp.copy_to_clipboard(content, mime=args.mime)
+        # Only the length is echoed back, as with `type`: it may be a secret.
+        fields = {"chars": len(content), "mime": args.mime or "text/plain"}
+        text = f"copied {len(content)} chars"
+    if not (args.paste or args.window):
+        return Out(_ok("clip_set", pasted=False, **fields), text)
+    out = _focused_input(args, "clip_set", lambda: inp.paste(_paste_keys(args)), pasted=True,
+                         **fields)
+    out.text = f"{text} and pasted"
+    return out
+
+
+@command
+def _cmd_clip_get(args: argparse.Namespace) -> Out:
+    content = inp.read_clipboard(mime=args.mime)
+    return Out({"text": content, "chars": len(content)}, content)
 
 
 # --- virtual desktops & sessions: the multi-agent orchestration surface ---
@@ -411,14 +541,106 @@ def _page(browser: Browser):
     return browser.active_tab() or browser.new_tab()
 
 
-def browser_goto(browser: Browser, url: str) -> dict:
+def _load_state(args: argparse.Namespace) -> str | None:
+    """--network-idle implies --wait-loaded; neither means "don't wait"."""
+    if getattr(args, "network_idle", False):
+        return "networkidle"
+    return "complete" if getattr(args, "wait_loaded", False) else None
+
+
+def browser_goto(browser: Browser, url: str, wait: str | None = None,
+                 load_timeout: float = browser_mod.DEFAULT_LOAD_TIMEOUT) -> dict:
     page = browser.goto(browser_mod.resolve_url(url))
-    return {"url": page.url, "title": page.title()}
+    data = {"url": page.url, "title": page.title()}
+    if wait:
+        data["load"] = browser_mod.wait_loaded(page, wait, load_timeout)
+        data["url"], data["title"] = page.url, page.title()
+    return data
 
 
-def browser_click(browser: Browser, selector: str) -> dict:
-    browser.click(selector)
-    return _ok("click", selector=selector)
+def browser_click(browser: Browser, selector: str, mode: str = "auto", wait: str | None = None,
+                  load_timeout: float = browser_mod.DEFAULT_LOAD_TIMEOUT) -> dict:
+    page = _page(browser)
+    before = browser_mod.document_id(page) if wait else None
+    result = browser_mod.click_element(page, selector, mode=mode)
+    data = _ok("click", selector=selector, method=result["method"], matches=result["matches"])
+    if "note" in result:
+        data["note"] = result["note"]
+    if wait:
+        browser_mod.await_navigation_start(page, before)
+        data["load"] = browser_mod.wait_loaded(page, wait, load_timeout)
+        data["url"] = page.url
+    return data
+
+
+def browser_check(browser: Browser, selector: str) -> dict:
+    return browser_mod.check_element(_page(browser), selector)
+
+
+def _check_text(data: dict) -> str:
+    if not data["exists"]:
+        return f"{data['selector']!r}: no match"
+    verdict = "interactable" if data["interactable"] else f"NOT interactable: {browser_mod._why_not(data)}"
+    return (f"{data['selector']!r}: {data['count']} match(es), <{data['tag']}> "
+            f"{data['text']!r} at {data['center']['x']},{data['center']['y']} -- {verdict}")
+
+
+def browser_dom(browser: Browser, root: str | None = None, ax: bool = False,
+                limit: int = browser_mod.DEFAULT_DOM_LIMIT, hidden: bool = False) -> dict:
+    page = _page(browser)
+    if ax:
+        return {"mode": "ax", **browser_mod.accessibility_tree(page, limit=limit)}
+    return {"mode": "elements",
+            **browser_mod.dom_outline(page, root=root, limit=limit, include_hidden=hidden)}
+
+
+def _dom_text(data: dict) -> str:
+    if data["mode"] == "ax":
+        lines = []
+        for n in data["nodes"]:
+            extra = "".join(f" [{k}={v}]" for k, v in n.items()
+                            if k not in ("depth", "role", "name"))
+            name = f' "{n["name"]}"' if n["name"] else ""
+            lines.append(f"{'  ' * n['depth']}- {n['role']}{name}{extra}")
+    else:
+        lines = [f"# {data['title']} -- {data['url']}"]
+        for e in data["elements"]:
+            flags = "".join(f" ({f})" for f in ("hidden", "disabled") if e.get(f))
+            if not e["in_viewport"]:
+                flags += " (offscreen)"
+            if "checked" in e:
+                flags += " (checked)" if e["checked"] else " (unchecked)"
+            box = e["box"]
+            center = f"{box['x'] + box['width'] // 2},{box['y'] + box['height'] // 2}"
+            lines.append(f'{e["role"]} "{e["name"]}"{flags}\t{e["selector"]}\t@{center}')
+    if data["truncated"]:
+        lines.append(f"... {data['total']} total, raise --limit to see more")
+    return "\n".join(lines)
+
+
+def browser_tabs(browser: Browser) -> dict:
+    return {"tabs": browser.tabs()}
+
+
+def _tabs_text(data: dict) -> str:
+    return "\n".join(f"{'*' if t['active'] else ' '} {t['index']}\t{t['title']}\t{t['url']}"
+                     for t in data["tabs"])
+
+
+def browser_tab(browser: Browser, pattern: str, wait: str | None = None,
+                load_timeout: float = browser_mod.DEFAULT_LOAD_TIMEOUT) -> dict:
+    """Bring a tab to the front (in the user's browser too), optionally waiting for it."""
+    page = browser.select_tab(pattern)
+    page.bring_to_front()
+    data = _ok("tab", url=page.url, title=page.title())
+    if wait:
+        data["load"] = browser_mod.wait_loaded(page, wait, load_timeout)
+    return data
+
+
+def browser_wait_loaded(browser: Browser, state: str,
+                        load_timeout: float = browser_mod.DEFAULT_LOAD_TIMEOUT) -> dict:
+    return browser_mod.wait_loaded(_page(browser), state, load_timeout)
 
 
 def browser_fill(browser: Browser, selector: str, text: str) -> dict:
@@ -456,7 +678,7 @@ def _ask_text(data: dict) -> str:
 def _read_question(args: argparse.Namespace) -> str:
     # Cached: stdin can only be read once, and validation reads it first.
     if not hasattr(args, "_question"):
-        args._question = sys.stdin.read() if args.question == "-" else args.question
+        args._question = _text_arg(args.question)
     return args._question
 
 
@@ -467,6 +689,16 @@ def _open_browser(args: argparse.Namespace, headless: bool | None = None) -> Bro
     return Browser(headless=args.headless if headless is None else headless)
 
 
+def _run_on_tab(run: Callable[[Browser, argparse.Namespace], dict]):
+    """Honor the browser-level --tab before running a command."""
+    def wrapped(b: Browser, args: argparse.Namespace) -> dict:
+        if getattr(args, "tab", None):
+            b.select_tab(args.tab)
+        return run(b, args)
+
+    return wrapped
+
+
 def _browser_command(run: Callable[[Browser, argparse.Namespace], dict],
                      text: Callable[[dict], str], headless: bool | None = None,
                      validate: Callable[[argparse.Namespace], None] | None = None):
@@ -475,7 +707,7 @@ def _browser_command(run: Callable[[Browser, argparse.Namespace], dict],
         if validate is not None:
             validate(args)  # fail fast, before a Chromium window pops up
         with _open_browser(args, headless) as b:
-            data = run(b, args)
+            data = _run_on_tab(run)(b, args)
         data["profile"] = str(b.profile) if b.profile is not None else None
         if b.cdp_port is not None:
             data["cdp_port"] = b.cdp_port
@@ -489,9 +721,33 @@ def _eval_text(data: dict) -> str:
     return result if isinstance(result, str) else json.dumps(result)
 
 
-_cmd_browser_goto = _browser_command(lambda b, a: browser_goto(b, a.url), lambda d: d["url"])
-_cmd_browser_click = _browser_command(lambda b, a: browser_click(b, a.selector),
-                                      lambda d: f"clicked {d['selector']!r}")
+_cmd_browser_goto = _browser_command(
+    lambda b, a: browser_goto(b, a.url, _load_state(a), a.load_timeout), lambda d: d["url"])
+_cmd_browser_click = _browser_command(
+    lambda b, a: browser_click(b, a.selector, a.mode, _load_state(a), a.load_timeout),
+    lambda d: f"clicked {d['selector']!r} ({d['method']})" + (f"; {d['note']}" if "note" in d else ""),
+)
+_cmd_browser_check = _browser_command(lambda b, a: browser_check(b, a.selector), _check_text)
+_cmd_browser_dom = _browser_command(
+    lambda b, a: browser_dom(b, a.root, a.ax, a.limit, a.hidden), _dom_text)
+_cmd_browser_tabs = _browser_command(lambda b, a: browser_tabs(b), _tabs_text)
+_cmd_browser_tab = _browser_command(
+    lambda b, a: browser_tab(b, a.pattern, _load_state(a), a.load_timeout),
+    lambda d: f"{d['title']}\t{d['url']}",
+)
+_cmd_browser_wait_loaded = _browser_command(
+    lambda b, a: browser_wait_loaded(b, _load_state(a) or "complete", a.load_timeout),
+    lambda d: f"{d['state']} after {d['waited']}s: {d['url']}",
+)
+_cmd_browser_upload = _browser_command(
+    lambda b, a: browser_mod.upload_files(_page(b), a.selector, a.files),
+    lambda d: f"uploaded {len(d['files'])} file(s) via {d['method']}",
+)
+_cmd_browser_drop = _browser_command(
+    lambda b, a: browser_mod.drop_files(_page(b), a.selector, a.files),
+    lambda d: f"dropped {len(d['files'])} file(s); "
+              f"{'the page took them' if d['handled'] else 'the page did NOT handle the drop'}",
+)
 _cmd_browser_fill = _browser_command(lambda b, a: browser_fill(b, a.selector, a.text),
                                      lambda d: f"filled {d['selector']!r}")
 _cmd_browser_eval = _browser_command(lambda b, a: browser_eval(b, a.expression), _eval_text)
@@ -521,11 +777,30 @@ def _cmd_browser_attach(args: argparse.Namespace) -> Out:
 
 @command
 def _cmd_browser_focus_and_goto(args: argparse.Namespace) -> Out:
-    """Fallback for browsers without CDP: focus a window, then Ctrl+L + type + Enter."""
+    """Focus a window, then Ctrl+L + type + Enter; with --wait-loaded, watch the
+    navigation over CDP until the new page is ready."""
     url = browser_mod.resolve_url(args.url)
+    state = _load_state(args)
+    cdp_port = getattr(args, "cdp_port", None)
+    if state and not cdp_port:
+        raise CliError(
+            "--wait-loaded needs --cdp-port: keystrokes alone can't see when the page is ready",
+            hint="start the browser with --remote-debugging-port=9222, then: "
+                 "control browser --cdp-port 9222 focus-and-goto PATTERN URL --wait-loaded",
+            kind="usage_error",
+        )
     win = _find_window(args.window, args)
-    browser_mod.focus_and_goto(win, url)
-    return Out(_ok("focus_and_goto", window=win.to_dict(), url=url), f"{win.id}\t-> {url}")
+    if not state:
+        entered_by = browser_mod.focus_and_goto(win, url)
+        return Out(_ok("focus_and_goto", window=win.to_dict(), url=url, entered_by=entered_by),
+                   f"{win.id}\t-> {url}")
+    with Browser.attach(port=cdp_port) as b:
+        before = browser_mod.document_ids(b.pages)
+        entered_by = browser_mod.focus_and_goto(win, url)
+        page, load = browser_mod.wait_for_navigation(b, url, before, state, args.load_timeout)
+        data = _ok("focus_and_goto", window=win.to_dict(), url=page.url, title=page.title(),
+                   entered_by=entered_by, load=load, cdp_port=cdp_port)
+    return Out(data, f"{win.id}\t-> {page.url} ({state} after {load['waited']}s)")
 
 
 @command
@@ -666,8 +941,18 @@ def build_parser() -> argparse.ArgumentParser:
     add_window_option(click)
 
     typ = leaf(sub, "type", _cmd_type)
-    typ.add_argument("text", help="text to type, or '-' to read it from stdin")
+    typ.add_argument("text", help="text to type, or '-' to read it (UTF-8) from stdin")
     typ.add_argument("--delay", type=int, default=0, metavar="MS", help="delay between keys")
+    typ.add_argument(
+        "--method", choices=inp.TEXT_METHODS, default="auto",
+        help="auto (default): type plain ASCII letters/digits, paste through the clipboard "
+             "anything with accents, ñ, symbols or other Unicode (ydotool drops or "
+             "remaps those); paste/type: force one. Use type for secrets: a clipboard "
+             "manager may keep pasted text in its history",
+    )
+    typ.add_argument("--paste-keys", default=None, metavar="KEYS",
+                     help="paste shortcut, e.g. ctrl+shift+v (default: ctrl+shift+v in "
+                          "terminals, ctrl+v elsewhere)")
     add_window_option(typ)
 
     key = leaf(
@@ -687,6 +972,37 @@ def build_parser() -> argparse.ArgumentParser:
         help="one or more key names (see input.KEYCODES), e.g. ctrl shift t",
     )
     add_window_option(key)
+
+    drag = leaf(sub, "drag", _cmd_drag,
+                help="press, glide and release the mouse (e.g. drag a file from Dolphin "
+                     "onto a web page); the button is always released, even on errors")
+    drag.add_argument("--from", dest="start", type=_point, required=True, metavar="X,Y")
+    drag.add_argument("--to", dest="end", type=_point, required=True, metavar="X,Y")
+    drag.add_argument("--button", default="left", choices=["left", "right", "middle"])
+    drag.add_argument("--steps", type=int, default=inp.DEFAULT_DRAG_STEPS,
+                      help="intermediate pointer moves; drop targets need them to see "
+                           f"dragover (default: {inp.DEFAULT_DRAG_STEPS})")
+    drag.add_argument("--hold", type=int, default=inp.DEFAULT_DRAG_HOLD_MS, metavar="MS",
+                      help="pause after pressing and before releasing "
+                           f"(default: {inp.DEFAULT_DRAG_HOLD_MS})")
+    add_window_option(drag)
+
+    clip = sub.add_parser("clip", help="Wayland clipboard (wl-copy/wl-paste)")
+    clip_sub = clip.add_subparsers(dest="clip_command", required=True)
+    c = leaf(clip_sub, "set", _cmd_clip_set,
+             help="copy text, or files as text/uri-list (paste them into a page instead "
+                  "of going through a file dialog)")
+    c.add_argument("text", nargs="?", default=None, help="text to copy, or '-' for stdin")
+    c.add_argument("--file", dest="files", action="append", default=[], metavar="PATH",
+                   help="copy this file (repeatable), like a file manager's Copy")
+    c.add_argument("--mime", default=None, help="MIME type to announce for TEXT")
+    c.add_argument("--paste", action="store_true",
+                   help="press Ctrl+V right after copying (into --window if given)")
+    c.add_argument("--paste-keys", default=None, metavar="KEYS",
+                   help="paste shortcut (default: ctrl+shift+v in terminals, ctrl+v elsewhere)")
+    add_window_option(c)
+    c = leaf(clip_sub, "get", _cmd_clip_get, help="print the clipboard contents")
+    c.add_argument("--mime", default=None, help="ask for this MIME type (e.g. text/uri-list)")
 
     desktop = sub.add_parser("desktop", help="KDE virtual desktops (create/remove/switch)")
     desktop_sub = desktop.add_subparsers(dest="desktop_command", required=True)
@@ -742,18 +1058,83 @@ def build_parser() -> argparse.ArgumentParser:
     browser.add_argument("--headless", action="store_true", help="run Chromium headless")
     browser.add_argument(
         "--cdp-port", type=int, default=None, metavar="PORT",
-        help="drive a Chromium already running (started with "
-             "--remote-debugging-port=PORT) instead of launching one; "
-             "applies to goto/click/fill/eval/snapshot",
+        help="drive a Chromium/Brave already running (started with "
+             "--remote-debugging-port=PORT) instead of launching one; commands then "
+             "act on the tab in front, and focus-and-goto can --wait-loaded",
+    )
+    browser.add_argument(
+        "--tab", default=None, metavar="PATTERN",
+        help="act on the tab whose URL or title contains PATTERN (or tab number N "
+             "from 'browser tabs') instead of the one in front",
     )
     browser_sub = browser.add_subparsers(dest="browser_command", required=True)
+
+    def add_load_options(parser: argparse.ArgumentParser) -> None:
+        parser.add_argument("--wait-loaded", action="store_true",
+                            help="return only once document.readyState is 'complete'")
+        parser.add_argument("--network-idle", action="store_true",
+                            help="like --wait-loaded, and also wait until no request has "
+                                 f"finished for {browser_mod.DEFAULT_NETWORK_IDLE}s (SPAs)")
+        parser.add_argument("--load-timeout", type=float,
+                            default=browser_mod.DEFAULT_LOAD_TIMEOUT, metavar="S",
+                            help=f"(default: {browser_mod.DEFAULT_LOAD_TIMEOUT:g})")
 
     b = leaf(browser_sub, "goto", _cmd_browser_goto,
              help="navigate the active tab to a URL, host, or AI site alias (e.g. gemini)")
     b.add_argument("url")
+    add_load_options(b)
 
-    b = leaf(browser_sub, "click", _cmd_browser_click, help="click an element by CSS selector")
+    b = leaf(browser_sub, "click", _cmd_browser_click,
+             help="click an element by CSS selector, after checking it exists and can be clicked")
     b.add_argument("selector")
+    b.add_argument("--mode", choices=browser_mod.CLICK_MODES, default="auto",
+                   help="native: trusted CDP mouse click; js: pointer/mouse events + el.click() "
+                        "in the page (React/Vue, hidden or covered targets); auto (default): "
+                        "native, falling back to js when native can't reach the element")
+    b.add_argument("--js", dest="mode", action="store_const", const="js",
+                   help="shorthand for --mode js")
+    add_load_options(b)
+
+    b = leaf(browser_sub, "check", _cmd_browser_check,
+             help="does SELECTOR exist, and is it visible, enabled, in view and uncovered?")
+    b.add_argument("selector")
+
+    b = leaf(browser_sub, "dom", _cmd_browser_dom,
+             help="list the page's clickable elements with unique selectors (or, with "
+                  "--ax, its accessibility tree via CDP)")
+    b.add_argument("--root", default=None, metavar="SELECTOR",
+                   help="only look inside this element (e.g. a dialog)")
+    b.add_argument("--ax", action="store_true",
+                   help="accessibility tree (Accessibility.getFullAXTree) instead")
+    b.add_argument("--limit", type=int, default=browser_mod.DEFAULT_DOM_LIMIT,
+                   help=f"max entries (default: {browser_mod.DEFAULT_DOM_LIMIT})")
+    b.add_argument("--hidden", action="store_true", help="include hidden elements too")
+
+    leaf(browser_sub, "tabs", _cmd_browser_tabs, help="list open tabs; * marks the one in front")
+
+    b = leaf(browser_sub, "tab", _cmd_browser_tab,
+             help="switch to (bring to front) the tab matching PATTERN or number N")
+    b.add_argument("pattern")
+    add_load_options(b)
+
+    b = leaf(browser_sub, "wait-loaded", _cmd_browser_wait_loaded,
+             help="block until the active tab has finished loading")
+    b.add_argument("--network-idle", action="store_true",
+                   help="also wait until the network has been idle for a moment")
+    b.add_argument("--load-timeout", type=float, default=browser_mod.DEFAULT_LOAD_TIMEOUT,
+                   metavar="S")
+
+    b = leaf(browser_sub, "upload", _cmd_browser_upload,
+             help="give files to a file <input> or to the button that opens the file "
+                  "chooser -- the native dialog never opens")
+    b.add_argument("selector")
+    b.add_argument("files", nargs="+", metavar="FILE")
+
+    b = leaf(browser_sub, "drop", _cmd_browser_drop,
+             help="drop files onto a drag-and-drop zone from inside the page "
+                  "(no mouse, no file manager)")
+    b.add_argument("selector")
+    b.add_argument("files", nargs="+", metavar="FILE")
 
     b = leaf(browser_sub, "fill", _cmd_browser_fill, help="fill a form field by CSS selector")
     b.add_argument("selector")
@@ -775,6 +1156,7 @@ def build_parser() -> argparse.ArgumentParser:
                   "and type a URL via Ctrl+L")
     b.add_argument("window", metavar="PATTERN", help="window title/class pattern to focus")
     b.add_argument("url")
+    add_load_options(b)
     add_desktop_option(b)
 
     leaf(browser_sub, "sites", _cmd_browser_sites, help="list the AI site shortcuts")
@@ -814,6 +1196,8 @@ _ERROR_HINTS: dict[type, str] = {
     windows.KdotoolError: "check that kdotool is installed and KWin scripting is enabled",
     windows.DesktopError: "list desktops with 'control desktop list' (KWin's D-Bus API must be reachable)",
     inp.YdotoolError: "check ydotoold is running: systemctl status ydotoold",
+    inp.ClipboardError: "install wl-clipboard (sudo pacman -S wl-clipboard) and run inside "
+                        "the Wayland session (WAYLAND_DISPLAY must be set)",
     inp.LockTimeout: (
         "another control process held the input lock too long; check with "
         "'control session status', or raise CONTROL_INPUT_LOCK_TIMEOUT"
@@ -892,8 +1276,9 @@ def _trace(args: argparse.Namespace, outcome: str) -> None:
 
 
 def main() -> None:
+    _utf8_stdio()
     parser = build_parser()
-    args = parser.parse_args()
+    args = parser.parse_args([utf8_arg(a) for a in sys.argv[1:]])
     try:
         bootstrap(args)
         args.func(args)
