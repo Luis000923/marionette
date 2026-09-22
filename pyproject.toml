@@ -24,3 +24,10 @@ module-name = "control"
 [build-system]
 requires = ["uv_build>=0.12.6,<0.13.0"]
 build-backend = "uv_build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Strict: a typo'd marker or a bad ini key is an error, and an xfail that
+# unexpectedly passes fails the run instead of being silently reported.
+addopts = ["--strict-markers", "--strict-config", "-ra"]
+xfail_strict = true

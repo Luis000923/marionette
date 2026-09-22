@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: pytest (Python 3.12)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    # No Xvfb, fake D-Bus or dummy kdotool/ydotool needed: tests/conftest.py
+    # empties PATH and stubs KWin, so every desktop call is mocked. Any test
+    # that forgets a mock fails with FileNotFoundError instead of passing by
+    # accident. The variables below make sure nothing leaks in from the runner.
+    env:
+      DISPLAY: ""
+      WAYLAND_DISPLAY: ""
+      DBUS_SESSION_BUS_ADDRESS: ""
+      CONTROL_JSON: ""
+      CONTROL_SESSION_ID: ""
+      PYTHONDONTWRITEBYTECODE: "1"
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v5
+
+      - name: Install uv and Python 3.12
+        uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install dependencies (incl. dev group)
+        # --locked: fail if uv.lock is out of date with pyproject.toml.
+        # Playwright's Python package is installed, but no browser binaries:
+        # the tests never launch Chromium.
+        run: uv sync --locked
+
+      - name: Smoke-test the CLI entry point
+        run: .venv/bin/control --help > /dev/null
+
+      - name: Run test suite
+        run: .venv/bin/python -m pytest -v
