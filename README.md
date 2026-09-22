@@ -9,7 +9,7 @@ browser automation. Stdlib + subprocess wrappers around `kdotool`, `ydotool`, an
 ```
 uv sync
 uv run playwright install chromium
-sudo ./scripts/install.sh   # installs ydotool/kdotool/wl-clipboard, enables ydotoold, group perms
+sudo ./scripts/install.sh   # installs ydotool/kdotool/wl-clipboard/AT-SPI, enables ydotoold, group perms
 ```
 
 ## Token efficiency for agents driving this tool
@@ -91,6 +91,19 @@ How the password is protected:
 `.env` is gitignored. The password is only used by the narrow setup helpers
 (`control.sudo.restart_ydotoold`, `control.sudo.ensure_uinput_group`). Everyday
 commands never touch sudo.
+
+## Launching apps
+
+`control app launch ID` takes the app's `.desktop` id, which is often not the
+command name: KCalc is `org.kde.kcalc`, Dolphin `org.kde.dolphin`. When the id
+is wrong, the error's hint names the likely one — matching the id's last
+segment, the display name, and typos:
+
+```
+$ control app launch kcalc
+[ERROR] app_launch_error: gtk-launch: no such application kcalc (did you mean: org.kde.kcalc? ...)
+$ control app list calc          # search ids and names
+```
 
 ## Waiting for slow-starting apps
 
@@ -456,6 +469,115 @@ Ctrl+V right after copying; with `--window` the focus and the paste happen under
 the input lock. Needs `wl-clipboard` (`sudo pacman -S wl-clipboard`; the install
 script adds it).
 
+### Key names
+
+`control key --list` prints every key name, grouped (modifiers, editing,
+navigation, function, letters, digits, punctuation, numpad, system), plus the
+aliases it accepts: names are case-insensitive, and the usual spellings from
+X11/xdotool work too — `Return` → `enter`, `Escape` → `esc`, `Control` →
+`ctrl`, `PgUp` → `pageup`, `win`/`cmd` → `super`, `del`, `bksp`, `-`, `/`...
+Key names are *physical* keys at their US positions; to enter text (accents,
+symbols) use `control type`, which handles layouts for you.
+
+```
+control key ctrl shift t
+control key Control Return          # same as: control key ctrl enter
+control key --list --json
+```
+
+## Native desktop apps (AT-SPI)
+
+Browsers have the DOM; native apps have the **accessibility tree** — the same
+one screen readers use. Through AT-SPI, `control a11y` lists an app's widgets
+with their role, name, states, available actions and text, reads a field's
+content, and operates widgets by *element* instead of by pixel:
+
+```
+control a11y enable                                   # once per login session
+control a11y status                                   # bus on? worker OK? which apps?
+control a11y tree --window Dolphin --interactive      # what can I operate here?
+control a11y tree --app kate --role "push button" --name Guardar
+control a11y read --window "Correo" --name Asunto     # a field's text, no screenshot
+control a11y do --app dolphin --role button --name Atrás      # runs the Press action
+control a11y focus --app kate --role text && control type "¡Hola, señor!"
+control a11y set-text --app kate --role text "texto nuevo"    # where the app allows it
+control a11y wait --app dolphin --role "list item" --name informe.pdf --settle 300
+```
+
+Output, one element per line — role, name, `[states]`, `{actions}`, text, and
+the element's **path** (child indices from the application, usable as `--path`):
+
+```
+# dolphin (pid 77937, Qt)
+button "Atrás" {ShowMenu, Press, SetFocus}          /0/6/1
+button "Adelante" [disabled]                        /0/6/2
+list item "cap1-vul-003.png" [focused, selected]    /0/0/0/0/0/0/2/0/0/2
+```
+
+- **Choosing the app:** `--window PATTERN` (the app owning that window, and only
+  that window's frame; nothing is focused), `--app NAME` or `--pid N`.
+- **Choosing the element:** `--path`, or filters `--role`, `--name`, `--text`
+  (substrings, case-insensitive), `--state focused` (repeatable),
+  `--interactive`, plus `--nth N`. With filters `tree` is a flat list of
+  matches. Hidden (not "showing") elements are skipped unless `--all`.
+- **Role names are normalized:** case, CamelCase, `_`/`-` and spacing don't
+  matter, and common spellings map to AT-SPI's own — `PushButton`/`push button`
+  → `button` (at-spi2-core 2.5x renamed it; `button` matches both spellings),
+  `checkbox` → `check box`, `textbox`/`input` → `entry`, `tab` → `page tab`,
+  `menuItem` → `menu item`, `window` → `frame`, `dropdown` → `combo box`.
+- **`do` needs no focus and no visibility.** The action runs inside the app, so
+  it works on a window on another virtual desktop — the user's screen does not
+  move. Apps implement actions themselves: "accepted" does not always mean
+  "done" (a Dolphin breadcrumb button accepts `Press` and ignores it), so
+  confirm the effect with `read`/`wait`/`win wait-settled`.
+- **Coordinates:** `box` is relative to the window. Wayland clients don't know
+  where their window is, so AT-SPI can't give screen coordinates; prefer `do`.
+- **`wait`** blocks until a match appears (or `--gone`), then with `--settle MS`
+  until the app's visible tree has not changed for that long — the native
+  counterpart of `browser --wait-loaded`.
+
+### Setup and what each toolkit exposes
+
+AT-SPI is reached through PyGObject (`gi`), a C extension distributions build
+for *their* Python. Instead of compiling it into the project venv, the tree is
+walked by a small worker (`src/control/_atspi_helper.py`) run by the system
+interpreter, which already has it; it talks JSON with the venv and uses only
+the standard library besides `gi`. Packages (the install script adds them):
+
+| Distribution | Packages |
+|---|---|
+| Arch | `python-gobject at-spi2-core` |
+| Debian/Ubuntu | `python3-gi gir1.2-atspi-2.0 at-spi2-core` |
+| Fedora | `python3-gobject at-spi2-core` |
+
+`CONTROL_ATSPI_PYTHON=/path/to/python3` picks another interpreter. `control a11y
+status` says whether the bus is on, which interpreter runs the worker, and which
+apps publish a tree.
+
+| Toolkit | After `control a11y enable` |
+|---|---|
+| Qt / KDE (Dolphin, Kate, Plasma, System Settings) | full tree immediately, no restart |
+| GTK | full tree (GTK 4 always publishes it) |
+| Chromium, Brave, Chrome | window frames only, until restarted with `--force-renderer-accessibility` |
+| Electron (VS Code, Slack, Discord...) | same flag; VS Code also honours `"editor.accessibilitySupport": "on"` |
+| kitty, most terminals | no tree (use `control type`/`key`) |
+
+`control a11y enable` sets `org.a11y.Status.IsEnabled` for the current login
+session only (`--off` reverts it). An app whose tree comes back empty gets a
+`hint` in the output explaining which of the above applies.
+
+### Waiting for a window to settle
+
+```
+control win activate Kate && control win wait-settled Kate && control key ctrl s
+```
+
+`win wait-settled PATTERN` returns once the window's title, geometry and focus
+have not changed for `--stable` ms (default 300): KWin animates activation,
+maximizing and moving (~150–250 ms), and apps retitle themselves while loading.
+Input sent mid-animation can land in the wrong place; this replaces the blind
+`sleep 1`. It exits with `timeout` if the window never settles.
+
 ## Running several agents in parallel
 
 Several agents can drive the same Plasma session at once. Each one gets its own
@@ -637,6 +759,50 @@ control session end --name agent_1 --remove-desktop
 This deletes the session record and, with `--remove-desktop`, its virtual
 desktop. KWin moves any remaining windows to another desktop; it does not close
 them. The browser profile and log are kept so you can inspect them afterwards.
+
+### Throwaway sandboxes and guard rails
+
+```
+control sandbox -- ./agent_task.sh
+control sandbox --name qa-run --keep-windows -- python run_checks.py
+```
+
+```
+control sandbox --timeout 120 -- ./agent_task.sh     # never runs longer than 2 minutes
+```
+
+`control sandbox -- COMMAND...` creates a fresh session on its own virtual
+desktop (without switching the screen to it), runs COMMAND with
+`CONTROL_SESSION_ID` set — so every window/app command inside is scoped to that
+desktop — and afterwards closes the windows the command opened there and
+removes the desktop. Only windows that did not exist before the run *and* live
+on exactly that desktop are closed (never panels or windows pinned to all
+desktops). If one refuses to close (an unsaved-changes dialog), the desktop is
+kept instead of removed, since removing it would drop that window onto the
+user's desktop — and so is the session record, so the desktop is never
+orphaned: `control session end --name NAME --remove-desktop` finishes the job.
+The exit status is COMMAND's; the report (`closed`, `killed_pids`, `left`,
+`desktop_removed`, `session_kept`, `timed_out`) goes to stderr, or to stdout
+with `--json`.
+
+`--timeout S` bounds the run. When it expires the shutdown goes from polite to
+firm: the windows the run opened are asked to close (apps get to save or ask),
+then COMMAND's process group gets SIGTERM and, after 5 s, SIGKILL — the group
+includes apps started through `control app launch`, since gtk-launch runs them
+as its children. An app whose window still won't close gets SIGTERM, then
+SIGKILL, *only* if that process owns no window outside the sandbox (a browser
+that opened one sandbox window keeps the user's other windows). The exit status
+is then 124, as with `timeout(1)`.
+
+Inside any session, commands that would reach outside the session's desktop
+are refused with `session_guard` unless `--force` is given: `desktop switch` to
+another desktop, and `win send` of a window to another desktop.
+
+A limit worth knowing: Wayland input (`type`, `key`, `click`) goes to the
+focused window, and focusing a window on another desktop makes KWin show that
+desktop. Reading and acting through AT-SPI (`a11y read/do/wait`) and CDP
+(`browser ...`) do not need focus, so they keep working on a sandbox desktop
+the user never sees.
 
 ## Machine-readable output for agents
 

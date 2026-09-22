@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import configparser
+import difflib
 import hashlib
 import subprocess
 import tempfile
@@ -28,7 +29,12 @@ class App:
 
 
 class AppLaunchError(RuntimeError):
-    pass
+    hint = "check the app id with: control app list"
+
+    def __init__(self, message: str, hint: str | None = None):
+        super().__init__(message)
+        if hint is not None:
+            self.hint = hint
 
 
 def list_apps() -> list[App]:
@@ -61,6 +67,37 @@ def list_apps() -> list[App]:
 def find(query: str) -> list[App]:
     q = query.lower()
     return [a for a in list_apps() if q in a.name.lower() or q in a.app_id.lower()]
+
+
+def suggest_ids(app_id: str, limit: int = 3) -> list[str]:
+    """Desktop-file ids the user probably meant by `app_id`.
+
+    The usual mistake is the short name for a reverse-DNS id ("kcalc" for
+    "org.kde.kcalc"), so ids ending in ".<app_id>" come first, then ids or
+    display names containing it, then look-alikes (typos).
+    """
+    q = app_id.lower().removesuffix(".desktop")
+    installed = list_apps()
+    ids = [a.app_id for a in installed]
+    ranked = [i for i in ids if i.lower().endswith("." + q)]
+    ranked += [a.app_id for a in installed if q in a.app_id.lower() or q in a.name.lower()]
+    # Typos: compare against what people actually type -- the id's last segment
+    # ("dolphin" of org.kde.dolphin) and the display name -- not the full id.
+    short: dict[str, str] = {}
+    for a in installed:
+        short.setdefault(a.app_id.lower().rsplit(".", 1)[-1], a.app_id)
+        short.setdefault(a.name.lower(), a.app_id)
+    ranked += [short[m] for m in difflib.get_close_matches(q, short, n=limit, cutoff=0.7)]
+    return list(dict.fromkeys(i for i in ranked if i.lower() != q))[:limit]
+
+
+def _launch_failed(app_id: str, result: subprocess.CompletedProcess) -> AppLaunchError:
+    suggestions = suggest_ids(app_id)
+    hint = (f"did you mean: {', '.join(suggestions)}? (ids are .desktop names; "
+            "list them with: control app list)" if suggestions else
+            f"no installed app looks like {app_id!r}; list the valid .desktop ids with: "
+            f"control app list")
+    return AppLaunchError(result.stderr.strip() or f"could not launch {app_id}", hint=hint)
 
 
 DEFAULT_WAIT_TIMEOUT = 30.0  # seconds; heavy apps (video editors, IDEs, office suites) can be slow
@@ -115,7 +152,7 @@ def launch(
     if desktop is None and not wait:
         result = _gtk_launch(app_id)
         if result.returncode != 0:
-            raise AppLaunchError(result.stderr.strip() or f"could not launch {app_id}")
+            raise _launch_failed(app_id, result)
         return result
 
     pattern = window_pattern or app_id
@@ -126,7 +163,7 @@ def launch(
         known = set(windows.window_ids(pattern))
         result = _gtk_launch(app_id)
         if result.returncode != 0:
-            raise AppLaunchError(result.stderr.strip() or f"could not launch {app_id}")
+            raise _launch_failed(app_id, result)
         # Searched across all desktops: the window appears wherever KWin put it.
         win = windows.wait_for_window(pattern, timeout=timeout, known_ids=known,
                                       activate=False)

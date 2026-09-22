@@ -127,6 +127,11 @@ class Window:
     def resize(self, width: int | str, height: int | str) -> None:
         _run("windowsize", self.id, str(width), str(height))
 
+    def pid(self) -> int | None:
+        """Process owning the window (what AT-SPI identifies applications by)."""
+        out = _run("getwindowpid", self.id).strip()
+        return int(out) if out.isdigit() else None
+
     def geometry(self) -> dict[str, int]:
         """{x, y, width, height} in screen coordinates (empty if kdotool says nothing).
 
@@ -288,6 +293,44 @@ def wait_for_window(pattern: str, timeout: float = 30.0, interval: float = 0.5,
         if time.monotonic() >= deadline:
             return None
         time.sleep(interval)
+
+
+def _window_state(win: Window) -> tuple:
+    try:
+        title = _run("getwindowname", win.id)
+    except KdotoolError:
+        title = None
+    try:
+        active = _run("getactivewindow") == win.id
+    except KdotoolError:
+        active = None
+    return (title, tuple(sorted(win.geometry().items())), active)
+
+
+def wait_settled(win: Window, stable: float = 0.3, timeout: float = 10.0,
+                 interval: float = 0.05) -> dict:
+    """Block until `win` stops changing: same title, geometry and focus for `stable` s.
+
+    Replaces a blind sleep after activating, launching, maximizing or moving a
+    window: KWin animates those (~150-250 ms), apps retitle themselves while
+    loading, and input sent mid-animation can land on the wrong spot. Returns
+    {settled, waited, title, geometry, active}; settled is False on timeout
+    (the window kept changing), and a window that disappears raises KdotoolError.
+    """
+    started = time.monotonic()
+    deadline = started + timeout
+    last, since = _window_state(win), time.monotonic()
+    while True:
+        time.sleep(interval)
+        now = time.monotonic()
+        current = _window_state(win)
+        if current != last:
+            last, since = current, now
+        settled = now - since >= stable
+        if settled or now >= deadline:
+            title, geometry, active = last
+            return {"settled": settled, "waited": round(now - started, 2), "title": title,
+                    "geometry": dict(geometry), "active": active}
 
 
 def wait_for_new_window(pattern: str, known_ids: set[str], timeout: float = 30.0,

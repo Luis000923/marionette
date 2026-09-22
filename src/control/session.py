@@ -21,8 +21,10 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import signal
 import subprocess
 import time
+import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -291,3 +293,199 @@ async def _no_windows() -> list:
 
 def status(include_windows: bool = True) -> dict:
     return asyncio.run(status_async(include_windows=include_windows))
+
+
+# --- ephemeral sandboxes ------------------------------------------------------------------
+
+#: How long windows get to close after the sandboxed command ends.
+SANDBOX_CLOSE_TIMEOUT = 5.0
+#: After --timeout: how long the command gets between SIGTERM and SIGKILL, and
+#: how long an app gets between SIGTERM and SIGKILL once its window refused to close.
+SANDBOX_TERM_GRACE = 5.0
+SANDBOX_KILL_GRACE = 3.0
+#: Exit status reported when --timeout stopped the command (as timeout(1) does).
+TIMEOUT_EXIT = 124
+
+
+def _windows_on(desktop: int) -> list[windows.Window]:
+    """Windows whose home is exactly `desktop` -- never ones shown on all desktops
+    (panels, docks, pinned windows), which `--desktop` queries also return."""
+    found = []
+    for win in windows.list_windows("", desktop=desktop):
+        try:
+            if win.get_desktop() == desktop:
+                found.append(win)
+        except windows.KdotoolError:
+            continue  # gone meanwhile
+    return found
+
+
+def sandbox(command: list[str], name: str | None = None, keep_windows: bool = False,
+            env: dict[str, str] | None = None, timeout: float | None = None) -> dict:
+    """Run `command` as an agent on a throwaway virtual desktop, then tear it down.
+
+    A fresh session (own desktop `control:<name>`, own browser profile) is
+    created without switching to it; `command` runs with CONTROL_SESSION_ID set,
+    so every window/app command it issues is scoped to that desktop. Afterwards
+    the windows it opened there are closed and the desktop is removed.
+
+    Only windows that did not exist before the run *and* live exactly on the
+    sandbox desktop are closed. If one refuses to close (an unsaved-changes
+    dialog...), the desktop is kept rather than removed -- removing it would
+    move that window onto the user's desktop -- and so is the session record,
+    so the desktop is never orphaned: `control session end --remove-desktop`
+    finishes the job.
+
+    With `timeout` (seconds), a command still running then is stopped in order:
+    first the windows it opened are asked to close (apps get to save or ask),
+    then its process group gets SIGTERM, and SIGKILL after SANDBOX_TERM_GRACE.
+    The group includes apps started with gtk-launch, which runs them as its
+    children. An app whose window still ignores the close is sent SIGTERM, then
+    SIGKILL -- but only when that process owns no window outside the sandbox
+    (a browser that opened one sandbox window keeps the user's other windows).
+    """
+    name = name or f"sandbox-{uuid.uuid4().hex[:6]}"
+    session = init(name)
+    before = set(windows.window_ids(""))
+    run_env = dict(os.environ if env is None else env)
+    run_env["CONTROL_SESSION_ID"] = name
+    report: dict = {"name": name, "desktop": session.desktop, "desktop_name": session.desktop_name,
+                    "timed_out": False}
+    closed_on_timeout: list[str] = []
+    try:
+        report["exit_code"], report["timed_out"] = _run_command(
+            command, run_env, timeout,
+            on_timeout=lambda: closed_on_timeout.extend(_close_new_windows(session, before)))
+    finally:
+        report.update(_teardown(session, before, keep_windows, force=report["timed_out"],
+                                already_closed=closed_on_timeout))
+    return report
+
+
+def _run_command(command: list[str], env: dict[str, str], timeout: float | None,
+                 on_timeout=None) -> tuple[int, bool]:
+    """(exit status, timed out). Without a timeout the command stays in our process
+    group, so Ctrl+C and an interactive stdin reach it as usual. `on_timeout` runs
+    before any signal is sent (the polite part of the shutdown)."""
+    if timeout is None:
+        return subprocess.run(command, env=env).returncode, False
+    # Its own process group, so the whole tree it spawned can be signalled at once.
+    proc = subprocess.Popen(command, env=env, start_new_session=True)
+    try:
+        return proc.wait(timeout=timeout), False
+    except subprocess.TimeoutExpired:
+        try:
+            if on_timeout is not None:
+                on_timeout()
+        finally:
+            _stop_group(proc)
+        return TIMEOUT_EXIT, True
+    except BaseException:
+        _stop_group(proc)  # Ctrl+C: its group no longer gets the terminal's SIGINT
+        raise
+
+
+def _signal_group(pgid: int, sig: int) -> bool:
+    try:
+        os.killpg(pgid, sig)
+        return True
+    except (ProcessLookupError, PermissionError):
+        return False
+
+
+def _stop_group(proc: subprocess.Popen) -> None:
+    """SIGTERM the command's process group, SIGKILL whatever is left after the grace."""
+    if not _signal_group(proc.pid, signal.SIGTERM):
+        return
+    try:
+        proc.wait(timeout=SANDBOX_TERM_GRACE)
+    except subprocess.TimeoutExpired:
+        pass
+    # Also reaches children that outlived a leader which exited on SIGTERM.
+    _signal_group(proc.pid, signal.SIGKILL)
+    try:
+        proc.wait(timeout=SANDBOX_KILL_GRACE)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+def _wait_gone(desktop: int, ids: set[str], timeout: float) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline and any(w.id in ids for w in _windows_on(desktop)):
+        time.sleep(0.2)
+
+
+def _killable_pids(stubborn: list[windows.Window], ours: set[str]) -> set[int]:
+    """Owners of `stubborn` windows that own no window outside the sandbox."""
+    pids: dict[int, list[str]] = {}
+    for win in stubborn:
+        try:
+            pid = win.pid()
+        except windows.KdotoolError:
+            continue
+        if pid and pid not in (os.getpid(), 1):
+            pids.setdefault(pid, [])
+    for win_id in windows.window_ids(""):
+        if win_id in ours:
+            continue
+        try:
+            pid = windows.Window(win_id).pid()
+        except windows.KdotoolError:
+            continue
+        if pid in pids:
+            pids[pid].append(win_id)  # this process also shows something of the user's
+    return {pid for pid, outside in pids.items() if not outside}
+
+
+def _kill_apps(pids: set[int], desktop: int, ids: set[str]) -> list[int]:
+    killed = []
+    for sig, grace in ((signal.SIGTERM, SANDBOX_KILL_GRACE), (signal.SIGKILL, SANDBOX_KILL_GRACE)):
+        alive = [w for w in _windows_on(desktop) if w.id in ids]
+        if not alive:
+            break
+        for pid in pids:
+            try:
+                os.kill(pid, sig)
+                if pid not in killed:
+                    killed.append(pid)
+            except (ProcessLookupError, PermissionError):
+                pass
+        _wait_gone(desktop, ids, grace)
+    return killed
+
+
+def _close_new_windows(session: Session, before: set[str]) -> list[str]:
+    """Ask every window the run opened on the sandbox desktop to close; wait for them."""
+    ours = [w for w in _windows_on(session.desktop) if w.id not in before]
+    closed = []
+    for win in ours:
+        try:
+            win.close()
+            closed.append(win.id)
+        except windows.KdotoolError:
+            pass
+    _wait_gone(session.desktop, {w.id for w in ours}, SANDBOX_CLOSE_TIMEOUT)
+    return closed
+
+
+def _teardown(session: Session, before: set[str], keep_windows: bool, force: bool = False,
+              already_closed: list[str] | None = None) -> dict:
+    # Windows closed when the timeout hit still count as the run's.
+    closed: list[str] = list(already_closed or [])
+    ours = [w for w in _windows_on(session.desktop) if w.id not in before]
+    our_ids = {w.id for w in ours} | set(closed)
+    killed: list[int] = []
+    if not keep_windows:
+        closed += _close_new_windows(session, before)
+        if force:
+            stubborn = [w for w in _windows_on(session.desktop) if w.id in our_ids]
+            if stubborn:
+                killed = _kill_apps(_killable_pids(stubborn, our_ids), session.desktop, our_ids)
+    left = [w.to_dict() for w in _windows_on(session.desktop)]
+    remove = not left
+    if remove:
+        end(session.name, remove_desktop=True)
+    else:
+        session.log(f"sandbox teardown left {len(left)} window(s); desktop kept")
+    return {"closed": closed, "killed_pids": killed, "left": left, "desktop_removed": remove,
+            "session_kept": not remove}

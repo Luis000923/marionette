@@ -31,7 +31,7 @@ from typing import Any, Callable
 
 from playwright.sync_api import Error as PlaywrightError
 
-from . import apps, env, input as inp, screenshot, session as session_mod, windows
+from . import apps, atspi, env, input as inp, screenshot, session as session_mod, windows
 from . import browser as browser_mod
 from .browser import Browser
 from .env import load_env
@@ -263,12 +263,28 @@ _cmd_win_move = _window_action("move", lambda w, a: w.move(a.x, a.y))
 _cmd_win_resize = _window_action("resize", lambda w, a: w.resize(a.width, a.height))
 
 
+def _guard_session_desktop(number: int, args: argparse.Namespace, what: str) -> None:
+    """Inside a session, never reach outside its own desktop without --force:
+    that desktop is the agent's sandbox, the others belong to the human (or to
+    other agents)."""
+    name = session_mod.current_name()
+    if not name or getattr(args, "force", False):
+        return
+    own = session_mod.resolve_desktop(None)
+    if own is not None and number != own:
+        raise CliError(
+            f"session {name!r} works on desktop {own}; refusing to {what} desktop {number}",
+            hint="pass --force if that is really intended", kind="session_guard",
+        )
+
+
 @command
 def _cmd_win_send(args: argparse.Namespace) -> Out:
     """Move a matching window onto another virtual desktop (created if named and missing)."""
     win = _require_window(args)
     target = str(args.target)
     number = int(target) if target.isdigit() else windows.resolve_desktop(target, create=True).number
+    _guard_session_desktop(number, args, "move a window to")
     win.move_to_desktop(number)
     return Out(_ok("send", window=win.to_dict(), desktop=number), f"{win.id}\t-> desktop {number}")
 
@@ -286,6 +302,17 @@ def _cmd_win_wait(args: argparse.Namespace) -> Out:
             kind="timeout",
         )
     return Out(win.to_dict(), _win_line(win))
+
+
+@command
+def _cmd_win_wait_settled(args: argparse.Namespace) -> Out:
+    win = _require_window(args)
+    state = windows.wait_settled(win, stable=args.stable / 1000, timeout=args.timeout)
+    state["window"] = win.to_dict()
+    if not state["settled"]:
+        raise CliError(f"window {win.id} was still changing after {args.timeout:g}s",
+                       hint="raise --timeout, or lower --stable", kind="timeout")
+    return Out(state, f"{win.id}\tsettled after {state['waited']}s")
 
 
 # --- screenshots ---------------------------------------------------------------
@@ -380,15 +407,33 @@ def _cmd_type(args: argparse.Namespace) -> Out:
     return out
 
 
+def _key_list() -> Out:
+    groups = {g: [k for k in keys if k in inp.KEYCODES] for g, keys in inp.KEY_GROUPS.items()}
+    lines = [f"{group}: {' '.join(keys)}" for group, keys in groups.items()]
+    by_target: dict[str, list[str]] = {}
+    for alias, target in inp.KEY_ALIASES.items():
+        by_target.setdefault(target, []).append(alias)
+    lines.append("aliases: " + "; ".join(f"{t} = {', '.join(a)}" for t, a in sorted(by_target.items())))
+    lines.append("names are case-insensitive physical keys (US positions); combine them: "
+                 "control key ctrl shift t. To enter text use: control type")
+    return Out({"keys": groups, "aliases": inp.KEY_ALIASES}, "\n".join(lines))
+
+
 @command
 def _cmd_key(args: argparse.Namespace) -> Out:
-    unknown = [k for k in args.keys if k.lower() not in inp.KEYCODES]
+    if args.list:
+        return _key_list()
+    if not args.keys:
+        raise CliError("no key given", hint="e.g. control key ctrl s; list names with: control key --list",
+                       kind="usage_error")
+    unknown = [k for k in args.keys if inp.resolve_key(k) is None]
     if unknown:
-        suggestions = difflib.get_close_matches(unknown[0].lower(), inp.KEYCODES, n=3)
+        suggestions = difflib.get_close_matches(unknown[0].lower(),
+                                                [*inp.KEYCODES, *inp.KEY_ALIASES], n=3)
         raise CliError(
             f"unknown key name(s): {', '.join(unknown)}",
             hint=f"did you mean: {', '.join(suggestions)}" if suggestions
-            else "see input.KEYCODES for valid names",
+            else "list valid names with: control key --list",
             kind="unknown_key",
         )
     return _focused_input(args, "key", lambda: inp.key_combo(*args.keys), keys=args.keys)
@@ -441,6 +486,182 @@ def _cmd_clip_get(args: argparse.Namespace) -> Out:
     return Out({"text": content, "chars": len(content)}, content)
 
 
+# --- native apps through AT-SPI ------------------------------------------------------
+
+def _a11y_request(args: argparse.Namespace) -> dict:
+    """Which app/element an a11y command is about, as worker parameters."""
+    req: dict[str, Any] = {"app": getattr(args, "app", None), "pid": getattr(args, "pid", None)}
+    if getattr(args, "window", None):
+        win = _find_window(args.window, args)
+        req["pid"] = win.pid()
+        req["window_title"] = win.title
+    if not any(req.values()):
+        raise CliError("say which application: --app NAME, --pid N or --window PATTERN",
+                       hint="list them with: control a11y apps", kind="usage_error")
+    role = getattr(args, "role", None)
+    flt = {"role": atspi.normalize_role(role) if role else None, "name": getattr(args, "name", None),
+           "text": getattr(args, "text", None), "states": getattr(args, "state", None) or None,
+           "interactive": getattr(args, "interactive", False) or None}
+    req["filter"] = {k: v for k, v in flt.items() if v}
+    for key in ("path", "nth", "limit", "depth"):
+        if getattr(args, key, None) is not None:
+            req[key] = getattr(args, key)
+    if getattr(args, "all", False):
+        req["all"] = True
+    return req
+
+
+def _node_line(n: dict, indent: bool = True) -> str:
+    parts = [("  " * n["depth"] if indent else "") + n["role"]]
+    if n["name"]:
+        parts.append(f'"{n["name"]}"')
+    if n.get("states"):
+        parts.append(f"[{', '.join(n['states'])}]")
+    if n.get("actions"):
+        parts.append("{" + ", ".join(n["actions"]) + "}")
+    if n.get("text"):
+        parts.append("text=" + json.dumps(n["text"], ensure_ascii=False))
+    if n.get("value"):
+        parts.append(f"value={n['value']['current']:g}")
+    return " ".join(parts) + f"\t{n['path'] or '/'}"
+
+
+def _a11y(op: str, args: argparse.Namespace, **extra: Any) -> dict:
+    atspi.require_enabled()
+    return atspi.call(op, **_a11y_request(args), **extra)
+
+
+@command
+def _cmd_a11y_status(args: argparse.Namespace) -> Out:
+    info = atspi.status()
+    lines = [f"bus enabled: {info['bus_enabled']}", f"worker python: {info['helper_python']}"]
+    if not info.get("available"):
+        lines.append(f"worker unavailable: {info.get('error')} ({info.get('hint')})")
+    lines += [f"  {a['pid']}\t{a['toolkit']}\t{a['name']}\t{a['children']} top-level"
+              for a in info["apps"] if a["children"]]
+    return Out(info, "\n".join(lines))
+
+
+@command
+def _cmd_a11y_enable(args: argparse.Namespace) -> Out:
+    atspi.set_enabled(not args.off)
+    enabled = atspi.is_enabled()
+    text = ("accessibility bus enabled: Qt/GTK apps publish their widgets now; restart "
+            "Chromium/Electron apps with --force-renderer-accessibility" if enabled
+            else "accessibility bus disabled")
+    return Out(_ok("a11y_enable", enabled=enabled), text)
+
+
+@command
+def _cmd_a11y_apps(args: argparse.Namespace) -> Out:
+    data = atspi.call("apps", all=args.all or None)
+    return Out(data, "\n".join(f"{a['pid']}\t{a['toolkit']}\t{a['name']}" for a in data["apps"]))
+
+
+def _tree_text(data: dict) -> str:
+    flat = bool(data.get("_flat"))
+    lines = [f"# {data['app']['name']} (pid {data['app']['pid']}, {data['app']['toolkit']})"]
+    lines += [_node_line(n, indent=not flat) for n in data["nodes"]]
+    if data.get("truncated"):
+        lines.append("... truncated: raise --limit, or narrow with --path/--role/--name")
+    if data.get("hint"):
+        lines.append(f"hint: {data['hint']}")
+    return "\n".join(lines)
+
+
+@command
+def _cmd_a11y_tree(args: argparse.Namespace) -> Out:
+    data = _a11y("tree", args)
+    flat = any(getattr(args, k, None) for k in ("role", "name", "text", "state", "interactive"))
+    return Out(data, _tree_text(dict(data, _flat=flat)))
+
+
+@command
+def _cmd_a11y_get(args: argparse.Namespace) -> Out:
+    data = _a11y("get", args)
+    el = data["element"]
+    lines = [_node_line(el, indent=False)]
+    if el.get("value"):
+        lines.append(f"value: {el['value']['current']:g} (range {el['value']['min']:g}..{el['value']['max']:g})")
+    if el.get("description"):
+        lines.append(f"description: {el['description']}")
+    lines.append(f"states: {', '.join(el.get('states_all', []))}")
+    return Out(data, "\n".join(lines))
+
+
+@command
+def _cmd_a11y_read(args: argparse.Namespace) -> Out:
+    """Just the content: a field's text, else its value, else its name."""
+    el = _a11y("get", args)["element"]
+    if el.get("text") is not None:
+        content = el["text"]
+    elif el.get("value"):
+        content = f"{el['value']['current']:g}"
+    else:
+        content = el["name"]
+    return Out({"path": el["path"], "role": el["role"], "name": el["name"], "content": content},
+               content)
+
+
+def _acted(verb: str):
+    return lambda d: f"{verb} {d['element']['role']} \"{d['element']['name']}\" ({d['path']})"
+
+
+@command
+def _cmd_a11y_do(args: argparse.Namespace) -> Out:
+    data = _a11y("action", args, action=args.action)
+    return Out(data, _acted(data["action"])(data))
+
+
+@command
+def _cmd_a11y_focus(args: argparse.Namespace) -> Out:
+    data = _a11y("focus", args)
+    return Out(data, _acted("focused")(data))
+
+
+@command
+def _cmd_a11y_set_text(args: argparse.Namespace) -> Out:
+    data = _a11y("set_text", args, value=_text_arg(args.value))
+    data["element"].pop("text", None)  # may be a secret: report the length only
+    data["chars"] = len(_text_arg(args.value)) if args.value != "-" else None
+    return Out(data, _acted("set text of")(data))
+
+
+@command
+def _cmd_a11y_wait(args: argparse.Namespace) -> Out:
+    # `timeout` bounds the worker process; `wait_timeout` is the wait itself.
+    data = _a11y("wait", args, gone=args.gone or None, wait_timeout=args.timeout,
+                 settle_ms=args.settle or None, timeout=args.timeout + 5)
+    what = "gone" if args.gone else ("found" if data.get("element") else "settled")
+    return Out(data, f"{what} after {data['waited']}s"
+               + (f": {_node_line(data['element'], indent=False)}" if data.get("element") else ""))
+
+
+@command
+def _cmd_sandbox(args: argparse.Namespace) -> Out:
+    command_line = args.cmd[1:] if args.cmd[:1] == ["--"] else args.cmd
+    if not command_line:
+        raise CliError("no command to run", hint="e.g. control sandbox -- ./agent_task.sh",
+                       kind="usage_error")
+    if args.timeout is not None and args.timeout <= 0:
+        raise CliError("--timeout must be positive", kind="usage_error")
+    report = session_mod.sandbox(command_line, name=args.name, keep_windows=args.keep_windows,
+                                 timeout=args.timeout)
+    text = (f"sandbox {report['name']} (desktop {report['desktop']}): "
+            + (f"timed out after {args.timeout:g}s, " if report["timed_out"] else "")
+            + f"exit {report['exit_code']}, closed {len(report['closed'])} window(s)"
+            + (f", killed pid(s) {', '.join(map(str, report['killed_pids']))}"
+               if report["killed_pids"] else "")
+            + ("" if report["desktop_removed"] else
+               f"; desktop and session kept, {len(report['left'])} window(s) still open "
+               f"(clean up with: control session end --name {report['name']} --remove-desktop)"))
+    if not _json_mode(args):
+        print(text, file=sys.stderr)  # stdout belongs to the sandboxed command
+        sys.exit(report["exit_code"])
+    print(json.dumps(report))
+    sys.exit(report["exit_code"])
+
+
 # --- virtual desktops & sessions: the multi-agent orchestration surface ---
 
 @command
@@ -476,6 +697,7 @@ def _cmd_desktop_current(args: argparse.Namespace) -> Out:
 def _cmd_desktop_switch(args: argparse.Namespace) -> Out:
     ref = str(args.desktop)
     number = int(ref) if ref.isdigit() else windows.resolve_desktop(ref).number
+    _guard_session_desktop(number, args, "switch the screen to")
     windows.set_desktop(number)
     return Out(_ok("switch", desktop=number))
 
@@ -893,9 +1115,20 @@ def build_parser() -> argparse.ArgumentParser:
     add_desktop_option(w)
 
     w = leaf(win_sub, "send", _cmd_win_send, help="move a window to another virtual desktop")
+    w.add_argument("--force", action="store_true",
+                   help="inside a session, allow sending windows off its own desktop")
     w.add_argument("pattern")
     w.add_argument("target", help="destination desktop: 1-based number, or a name "
                                   "(created if it doesn't exist)")
+    add_desktop_option(w)
+
+    w = leaf(win_sub, "wait-settled", _cmd_win_wait_settled,
+             help="block until a window stops changing (title, geometry, focus): "
+                  "use after activate/launch/maximize instead of a blind sleep")
+    w.add_argument("pattern")
+    w.add_argument("--stable", type=int, default=300, metavar="MS",
+                   help="how long nothing may change (default: 300)")
+    w.add_argument("--timeout", type=float, default=10.0)
     add_desktop_option(w)
 
     w = leaf(win_sub, "wait", _cmd_win_wait,
@@ -968,9 +1201,11 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     key.add_argument(
-        "keys", nargs="+",
-        help="one or more key names (see input.KEYCODES), e.g. ctrl shift t",
+        "keys", nargs="*",
+        help="one or more key names, e.g. ctrl shift t (aliases like Return, Escape, "
+             "PgUp work too; see --list)",
     )
+    key.add_argument("--list", action="store_true", help="print every key name and alias")
     add_window_option(key)
 
     drag = leaf(sub, "drag", _cmd_drag,
@@ -1023,6 +1258,19 @@ def build_parser() -> argparse.ArgumentParser:
 
     d = leaf(desktop_sub, "switch", _cmd_desktop_switch)
     d.add_argument("desktop", metavar="N|NAME", help="desktop number (1-based) or name")
+    d.add_argument("--force", action="store_true",
+                   help="inside a session, allow switching to a desktop other than its own")
+
+    sb = leaf(sub, "sandbox", _cmd_sandbox,
+              help="run a command as an agent on a throwaway virtual desktop, then close "
+                   "the windows it opened there and remove the desktop")
+    sb.add_argument("--name", default=None, help="session name (default: sandbox-<random>)")
+    sb.add_argument("--keep-windows", action="store_true",
+                    help="leave the windows (and so the desktop) in place afterwards")
+    sb.add_argument("--timeout", type=float, default=None, metavar="S",
+                    help="stop the command after S seconds (SIGTERM, then SIGKILL), close its "
+                         "windows, end apps that ignore that, and remove the desktop; exit 124")
+    sb.add_argument("cmd", nargs=argparse.REMAINDER, metavar="-- COMMAND ...")
 
     sess = sub.add_parser("session", help="multi-agent workspaces (one desktop + profile each)")
     sess_sub = sess.add_subparsers(dest="session_command", required=True)
@@ -1045,6 +1293,73 @@ def build_parser() -> argparse.ArgumentParser:
     sc.add_argument("--name", required=True)
     sc.add_argument("--remove-desktop", action="store_true",
                     help="also delete the session's virtual desktop")
+
+    a11y = sub.add_parser("a11y", help="native apps (Qt/GTK/Electron) through the AT-SPI "
+                                       "accessibility tree: read and operate widgets by name")
+    a11y_sub = a11y.add_subparsers(dest="a11y_command", required=True)
+
+    def a11y_target(parser: argparse.ArgumentParser, element: bool = True) -> None:
+        parser.add_argument("--app", default=None, help="application name (substring)")
+        parser.add_argument("--pid", type=int, default=None)
+        parser.add_argument("--window", default=None, metavar="PATTERN",
+                            help="the app owning this window (only its frame is walked); "
+                                 "nothing gets focused")
+        add_desktop_option(parser)
+        if not element:
+            return
+        parser.add_argument("--path", default=None, help="element path from 'a11y tree', e.g. /0/3/1")
+        parser.add_argument("--role", default=None, help="role contains, e.g. 'push button', entry")
+        parser.add_argument("--name", default=None, help="accessible name contains (case-insensitive)")
+        parser.add_argument("--text", default=None, help="text content contains")
+        parser.add_argument("--state", action="append", default=[], metavar="STATE",
+                            help="required state, e.g. focused, checked (repeatable)")
+        parser.add_argument("--interactive", action="store_true",
+                            help="only elements with actions or that are editable/focusable")
+        parser.add_argument("--nth", type=int, default=None, help="pick the Nth match (0-based)")
+        parser.add_argument("--all", action="store_true", help="include hidden (not showing) elements")
+
+    leaf(a11y_sub, "status", _cmd_a11y_status,
+         help="is the bus on, can the worker run, which apps publish a tree")
+    x = leaf(a11y_sub, "enable", _cmd_a11y_enable,
+             help="turn the accessibility bus on for this login session (--off to turn it off)")
+    x.add_argument("--off", action="store_true")
+    x = leaf(a11y_sub, "apps", _cmd_a11y_apps, help="applications on the accessibility bus")
+    x.add_argument("--all", action="store_true", help="include apps that publish no widgets")
+
+    x = leaf(a11y_sub, "tree", _cmd_a11y_tree,
+             help="an app's widgets: role, name, states, actions, text and path "
+                  "(with --role/--name/... a flat list of matches)")
+    a11y_target(x)
+    x.add_argument("--depth", type=int, default=None, help="max depth below --path")
+    x.add_argument("--limit", type=int, default=None, help="max elements (default: 300)")
+
+    for name, func, text in (
+        ("get", _cmd_a11y_get, "everything about one element (full text, value, all states)"),
+        ("read", _cmd_a11y_read, "just an element's content: its text, else value, else name"),
+        ("focus", _cmd_a11y_focus, "give an element keyboard focus (then: control type)"),
+    ):
+        a11y_target(leaf(a11y_sub, name, func, help=text))
+
+    x = leaf(a11y_sub, "do", _cmd_a11y_do,
+             help="run an element's action (Press, Toggle, Activate...) inside the app: "
+                  "no coordinates, no focus needed")
+    a11y_target(x)
+    x.add_argument("--action", default=None,
+                   help="action name or index (default: the first one listed)")
+
+    x = leaf(a11y_sub, "set-text", _cmd_a11y_set_text,
+             help="replace an editable field's text through AT-SPI")
+    a11y_target(x)
+    x.add_argument("value", help="the new text, or '-' for stdin (UTF-8)")
+
+    x = leaf(a11y_sub, "wait", _cmd_a11y_wait,
+             help="block until an element appears (or --gone), and/or until the app's "
+                  "visible tree stops changing (--settle)")
+    a11y_target(x)
+    x.add_argument("--gone", action="store_true", help="wait for the match to disappear")
+    x.add_argument("--settle", type=int, default=0, metavar="MS",
+                   help="then wait until the visible tree is unchanged for MS")
+    x.add_argument("--timeout", type=float, default=10.0)
 
     snap = leaf(
         sub, "snapshot", _cmd_snapshot,
@@ -1207,6 +1522,7 @@ _ERROR_HINTS: dict[type, str] = {
     screenshot.ScreenshotError: "check that spectacle is installed and works: spectacle -b -n -f",
     env.EnvPermissionError: "restrict the file to its owner: chmod 600 <file>",
     browser_mod.BrowserError: "browser automation failed",
+    atspi.AtspiError: "check the accessibility setup with: control a11y status",
     PlaywrightError: "browser action failed; check the selector/URL and that the page finished loading",
 }
 

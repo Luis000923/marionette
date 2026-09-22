@@ -62,6 +62,49 @@ KEYCODES: dict[str, int] = {
     "leftbracket": 26, "rightbracket": 27,
 }
 
+#: Other names agents (and xdotool/X11 keysyms) use for the same keys. Matched
+#: case-insensitively, like the canonical names.
+KEY_ALIASES: dict[str, str] = {
+    "return": "enter", "ret": "enter", "escape": "esc", "control": "ctrl", "lctrl": "ctrl",
+    "leftctrl": "ctrl", "control_l": "ctrl", "control_r": "rightctrl", "rctrl": "rightctrl",
+    "lshift": "shift", "leftshift": "shift", "shift_l": "shift", "rshift": "rightshift",
+    "shift_r": "rightshift", "lalt": "alt", "leftalt": "alt", "alt_l": "alt", "option": "alt",
+    "ralt": "rightalt", "alt_r": "rightalt", "altgr": "rightalt", "win": "super",
+    "windows": "super", "logo": "super", "cmd": "super", "super_l": "super", "del": "delete",
+    "ins": "insert", "pgup": "pageup", "page_up": "pageup", "prior": "pageup", "pgdn": "pagedown",
+    "pgdown": "pagedown", "page_down": "pagedown", "next": "pagedown", "bksp": "backspace",
+    "back": "backspace", "spacebar": "space", "caps": "capslock", "caps_lock": "capslock",
+    "print": "sysrq", "prtsc": "sysrq", "arrowup": "up", "arrowdown": "down",
+    "arrowleft": "left", "arrowright": "right", "period": "dot", "-": "minus", "=": "equal",
+    ",": "comma", ".": "dot", "/": "slash", ";": "semicolon", "'": "apostrophe", "`": "grave",
+    "[": "leftbrace", "]": "rightbrace", "\\": "backslash", "menu_key": "menu", "apps": "menu",
+}
+
+#: How `control key --list` groups KEYCODES.
+KEY_GROUPS: dict[str, tuple[str, ...]] = {
+    "modifiers": ("ctrl", "rightctrl", "shift", "rightshift", "alt", "rightalt", "super", "meta"),
+    "editing": ("enter", "tab", "space", "backspace", "delete", "insert", "esc"),
+    "navigation": ("up", "down", "left", "right", "home", "end", "pageup", "pagedown"),
+    "function": tuple(f"f{i}" for i in range(1, 13)),
+    "letters": tuple("abcdefghijklmnopqrstuvwxyz"),
+    "digits": tuple("0123456789"),
+    "punctuation (US key positions)": ("minus", "equal", "leftbrace", "rightbrace",
+                                       "leftbracket", "rightbracket", "backslash", "semicolon",
+                                       "apostrophe", "grave", "comma", "dot", "slash"),
+    "numpad": ("kp0", "kp1", "kp2", "kp3", "kp4", "kp5", "kp6", "kp7", "kp8", "kp9", "kpdot",
+               "kpminus", "kpplus", "kpasterisk", "kpslash", "kpenter", "numlock"),
+    "system": ("sysrq", "printscreen", "scrolllock", "pause", "menu", "capslock"),
+}
+
+
+def resolve_key(name: str) -> str | None:
+    """Canonical KEYCODES name for `name` or one of its aliases (None if unknown)."""
+    key = name.lower()
+    if key in KEYCODES:
+        return key
+    return KEY_ALIASES.get(key)
+
+
 # ydotool click byte = mode nibble | button nibble.
 # Mode: 0xC=click (down+up), 0x4=down only, 0x8=up only.
 _BUTTON_NIBBLE = {"left": 0x0, "right": 0x1, "middle": 0x2}
@@ -227,7 +270,12 @@ def type_text(text: str, delay_ms: int = 0) -> None:
 
 def key_combo(*keys: str) -> None:
     """Press keys together, e.g. key_combo('ctrl', 'shift', 't')."""
-    codes = [KEYCODES[k.lower()] for k in keys]
+    codes = []
+    for k in keys:
+        canonical = resolve_key(k)
+        if canonical is None:
+            raise KeyError(k)
+        codes.append(KEYCODES[canonical])
     down = [f"{c}:1" for c in codes]
     up = [f"{c}:0" for c in reversed(codes)]
     _run("key", *down, *up)
