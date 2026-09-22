@@ -32,6 +32,7 @@ from typing import Any, Callable
 from playwright.sync_api import Error as PlaywrightError
 
 from . import apps, env, input as inp, screenshot, session as session_mod, windows
+from . import browser as browser_mod
 from .browser import Browser
 from .env import load_env
 
@@ -411,7 +412,7 @@ def _page(browser: Browser):
 
 
 def browser_goto(browser: Browser, url: str) -> dict:
-    page = browser.goto(url)
+    page = browser.goto(browser_mod.resolve_url(url))
     return {"url": page.url, "title": page.title()}
 
 
@@ -434,11 +435,39 @@ def browser_snapshot(browser: Browser) -> dict:
     return {"url": page.url, "text": page.inner_text("body")}
 
 
+def browser_ask(browser: Browser, site: str, question: str, timeout: float,
+                settle: float, continue_thread: bool = False) -> dict:
+    """Ask an AI site, optionally inside the conversation this profile used last."""
+    url = browser_mod.last_thread(browser.profile, site) if continue_thread else None
+    result = browser_mod.ask(browser, site, question, timeout=timeout, settle=settle, url=url)
+    browser_mod.remember_thread(browser.profile, site, result.url)
+    data = result.to_dict()
+    data["continued"] = url is not None
+    return data
+
+
+def _ask_text(data: dict) -> str:
+    if not data["complete"]:
+        print("[WARN] the answer was still changing when --timeout hit; it may be cut off",
+              file=sys.stderr)
+    return data["response"]
+
+
+def _read_question(args: argparse.Namespace) -> str:
+    # Cached: stdin can only be read once, and validation reads it first.
+    if not hasattr(args, "_question"):
+        args._question = sys.stdin.read() if args.question == "-" else args.question
+    return args._question
+
+
 def _browser_command(run: Callable[[Browser, argparse.Namespace], dict],
-                     text: Callable[[dict], str]):
+                     text: Callable[[dict], str], headless: bool | None = None,
+                     validate: Callable[[argparse.Namespace], None] | None = None):
     @command
     def handler(args: argparse.Namespace) -> Out:
-        with Browser(headless=args.headless) as b:
+        if validate is not None:
+            validate(args)  # fail fast, before a Chromium window pops up
+        with Browser(headless=args.headless if headless is None else headless) as b:
             data = run(b, args)
         data["profile"] = str(b.profile)
         return Out(data, text(data))
@@ -458,6 +487,26 @@ _cmd_browser_fill = _browser_command(lambda b, a: browser_fill(b, a.selector, a.
                                      lambda d: f"filled {d['selector']!r}")
 _cmd_browser_eval = _browser_command(lambda b, a: browser_eval(b, a.expression), _eval_text)
 _cmd_browser_snapshot = _browser_command(lambda b, a: browser_snapshot(b), lambda d: d["text"])
+_cmd_browser_ask = _browser_command(
+    lambda b, a: browser_ask(b, a.site, _read_question(a), a.timeout, a.settle, a.continue_thread),
+    _ask_text,
+    validate=lambda a: browser_mod.check_ask(a.site, _read_question(a)),
+)
+# Always headed: a human has to type the password in the window.
+_cmd_browser_login = _browser_command(
+    lambda b, a: {"site": browser_mod.get_site(a.site).name, "logged_in": True,
+                  "url": browser_mod.wait_for_login(b, a.site, timeout=a.timeout)},
+    lambda d: f"logged in to {d['site']}; the session is saved in the browser profile",
+    headless=False,
+    validate=lambda a: browser_mod.get_site(a.site),
+)
+
+
+@command
+def _cmd_browser_sites(args: argparse.Namespace) -> Out:
+    catalog = browser_mod.sites()
+    lines = [f"{s.name}\t{'ask' if s.can_ask else '-'}\t{s.url}" for s in catalog.values()]
+    return Out([s.to_dict() for s in catalog.values()], "\n".join(lines))
 
 
 # --- parser ------------------------------------------------------------------
@@ -667,7 +716,8 @@ def build_parser() -> argparse.ArgumentParser:
     browser.add_argument("--headless", action="store_true", help="run Chromium headless")
     browser_sub = browser.add_subparsers(dest="browser_command", required=True)
 
-    b = leaf(browser_sub, "goto", _cmd_browser_goto, help="navigate the active tab to a URL")
+    b = leaf(browser_sub, "goto", _cmd_browser_goto,
+             help="navigate the active tab to a URL, host, or AI site alias (e.g. gemini)")
     b.add_argument("url")
 
     b = leaf(browser_sub, "click", _cmd_browser_click, help="click an element by CSS selector")
@@ -681,6 +731,25 @@ def build_parser() -> argparse.ArgumentParser:
     b.add_argument("expression")
 
     leaf(browser_sub, "snapshot", _cmd_browser_snapshot, help="dump the visible text of the active page")
+
+    leaf(browser_sub, "sites", _cmd_browser_sites, help="list the AI site shortcuts")
+
+    b = leaf(browser_sub, "ask", _cmd_browser_ask,
+             help="ask an AI chat site a question and print its answer")
+    b.add_argument("site", help="chatgpt, gemini or claude (see: control browser sites)")
+    b.add_argument("question", help="the question, or '-' to read it from stdin")
+    b.add_argument("--timeout", type=float, default=browser_mod.DEFAULT_ASK_TIMEOUT,
+                   help=f"seconds to wait for the full answer (default: "
+                        f"{browser_mod.DEFAULT_ASK_TIMEOUT:.0f})")
+    b.add_argument("--settle", type=float, default=browser_mod.DEFAULT_SETTLE,
+                   help="seconds the answer must stay unchanged to count as finished")
+    b.add_argument("--continue", dest="continue_thread", action="store_true",
+                   help="ask inside the last conversation with this site, not a new chat")
+
+    b = leaf(browser_sub, "login", _cmd_browser_login,
+             help="open an AI site (headed) and wait while you log in by hand")
+    b.add_argument("site")
+    b.add_argument("--timeout", type=float, default=300.0)
 
     return p
 
@@ -708,11 +777,14 @@ _ERROR_HINTS: dict[type, str] = {
     apps.AppLaunchError: "check the app id with: control app list",
     screenshot.ScreenshotError: "check that spectacle is installed and works: spectacle -b -n -f",
     env.EnvPermissionError: "restrict the file to its owner: chmod 600 <file>",
+    browser_mod.BrowserError: "browser automation failed",
     PlaywrightError: "browser action failed; check the selector/URL and that the page finished loading",
 }
 
 
 def _hint_for(exc: BaseException) -> str:
+    if getattr(exc, "hint", ""):
+        return exc.hint  # errors that know their own next step (browser.py)
     for klass in type(exc).__mro__:
         if klass in _ERROR_HINTS:
             return _ERROR_HINTS[klass]

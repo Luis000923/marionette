@@ -119,7 +119,7 @@ class TestJsonEverywhere:
                 return Page()
 
         b = FakeBrowser()
-        assert cli.browser_goto(b, "x") == {"url": "https://example.com/", "title": "Example"}
+        assert cli.browser_goto(b, "https://example.com/") == {"url": "https://example.com/", "title": "Example"}
         assert cli.browser_eval(b, "1+1") == {"result": {"n": 2}}
         assert cli.browser_snapshot(b) == {"url": "https://example.com/", "text": "hello"}
 

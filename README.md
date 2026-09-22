@@ -82,6 +82,103 @@ with keyboard shortcuts (`control key ...`) and cached window state (id/geometry
 `control win list --json`) over repeated screenshot-and-inspect round-trips — re-query
 the window only when you expect its state actually changed.
 
+## Asking other AIs for a second opinion
+
+`control browser` knows a few AI chat sites by name, so an agent (Claude, for
+instance) can check its reasoning against another model with one command.
+
+```
+control browser sites                        # the catalog; "ask" marks the drivable ones
+control browser goto gemini                  # aliases work anywhere a URL does
+control browser ask gemini "¿Cómo optimizo esta función en Python?"
+control --json browser ask chatgpt "Review this approach: ..."
+cat snippet.py | control browser ask claude -          # long prompts / code from stdin
+control browser ask gemini "¿Y con numpy?" --continue  # follow up in the same conversation
+```
+
+| Site | Alias(es) | `goto` | `ask` |
+|---|---|---|---|
+| ChatGPT | `chatgpt`, `gpt`, `openai` | yes | yes |
+| Gemini | `gemini`, `bard` | yes | yes |
+| Claude | `claude` | yes | yes |
+| Perplexity, Copilot, DeepSeek, Mistral Le Chat | `perplexity`, `copilot`, `deepseek`, `mistral` | yes | no (bookmarks) |
+
+`goto` also accepts full URLs and bare hosts (`example.com` becomes
+`https://example.com`). An unknown word is an error, never a web search.
+
+### Log in once
+
+These sites need an account, and `ask` never types credentials. Log in by hand
+once. The cookies stay in the persistent Chromium profile, and every later
+command reuses them:
+
+```
+control browser login gemini        # opens a window; returns once the chat box appears
+```
+
+`login` is always headed, even with `--headless`, because you type the password
+in the window. With a session (`--session NAME`), each agent has its own
+profile, so each agent logs in separately. Two commands can't use the same
+profile at the same time: Chromium locks it, and `control` reports that as a
+clear error instead of a stack trace.
+
+### How `ask` works
+
+1. It opens the site in the session's profile, or reuses a tab already on it.
+2. It waits for the chat box. If it gets redirected to a sign-in page, or sees
+   logged-out markers, it fails with `login_required`.
+3. It counts the assistant messages already on the page, then types the question
+   and clicks Send (or presses Enter).
+4. It waits for a **new** assistant message. The answer counts as finished once
+   its text hasn't changed for `--settle` seconds (default 2) and the Stop button
+   is gone.
+5. It prints the answer. With `--json`:
+
+   ```json
+   {"site": "gemini", "url": "https://gemini.google.com/app/…", "response": "…",
+    "complete": true, "elapsed": 7.4, "question_chars": 38, "continued": false,
+    "profile": "…/browser-profile"}
+   ```
+
+If `--timeout` (default 180 s) runs out mid-answer, you get the partial text with
+`"complete": false` (and a warning on stderr in text mode). No answer at all
+fails with `response_timeout`. `--continue` reopens the last conversation this
+profile had with that site. It's remembered in `control-ai-threads.json` inside
+the profile.
+
+Errors an agent can branch on: `login_required`, `selector_not_found`,
+`response_timeout`, `unknown_site`, `browser_error`.
+
+### When a site changes its layout
+
+The selectors in `browser.AI_SITES` are ordered fallbacks, and they cover English
+and Spanish UIs. They will still break when a site redesigns its page. That
+shows up as `selector_not_found`. Fix it without touching code by pointing
+`CONTROL_AI_SITES` at a JSON file. Selectors from the file are tried **before**
+the built-in ones. The same file can add a new site:
+
+```json
+{
+  "gemini": {"input": ["div.new-composer[contenteditable='true']"]},
+  "local":  {"url": "http://localhost:3000/chat", "input": ["textarea"],
+             "send": ["button[type=submit]"], "response": [".assistant"],
+             "busy": [".spinner"]}
+}
+```
+
+Fields: `url`, `input`, `send`, `response`, `busy`, `login`, `login_hosts`,
+`hosts`, `description`.
+
+### Things to keep in mind
+
+- **Whatever you ask is sent to that provider**, under the account logged in to
+  the profile. Don't paste secrets, credentials or private code you aren't allowed
+  to share.
+- Automating a web UI may be restricted by the provider's terms of service. Use
+  your own account, at a human pace. If you need volume, use the provider's API.
+- Headless Chromium is more likely to hit bot checks (Cloudflare and similar),
+  which is why the browser runs headed by default.
+
 ## Running several agents in parallel
 
 Several agents can drive the same Plasma session at once. Each one gets its own
