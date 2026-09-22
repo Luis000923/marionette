@@ -65,6 +65,34 @@ class TestSearch:
         assert results == [windows.Window(id="111", title="", classname="")]
 
 
+class TestWaitForWindow:
+    def test_returns_immediately_when_window_already_present(self):
+        with patch("control.windows.find_one", return_value=windows.Window(id="1", title="t", classname="c")) as mock_find, \
+             patch("control.windows.time.sleep") as mock_sleep:
+            win = windows.wait_for_window("t", timeout=5, interval=0.1)
+        assert win is not None
+        assert win.id == "1"
+        mock_find.assert_called_once_with("t")
+        mock_sleep.assert_not_called()
+
+    def test_polls_until_window_appears(self):
+        results = [None, None, windows.Window(id="2", title="t", classname="c")]
+        with patch("control.windows.find_one", side_effect=results), \
+             patch("control.windows.time.sleep") as mock_sleep, \
+             patch("control.windows.time.monotonic", side_effect=[0, 0, 1, 2, 3]):
+            win = windows.wait_for_window("t", timeout=10, interval=0.1)
+        assert win is not None
+        assert win.id == "2"
+        assert mock_sleep.call_count == 2
+
+    def test_returns_none_on_timeout(self):
+        with patch("control.windows.find_one", return_value=None), \
+             patch("control.windows.time.sleep"), \
+             patch("control.windows.time.monotonic", side_effect=[0, 5, 11]):
+            win = windows.wait_for_window("nope", timeout=10, interval=0.1)
+        assert win is None
+
+
 class TestFindOne:
     def test_find_one_returns_first_match(self):
         responses = [

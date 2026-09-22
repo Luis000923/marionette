@@ -67,7 +67,13 @@ def _cmd_apps_list(args: argparse.Namespace) -> None:
 
 
 def _cmd_apps_launch(args: argparse.Namespace) -> None:
-    apps.launch(args.app_id)
+    if args.wait:
+        win = apps.launch(args.app_id, wait=True, timeout=args.timeout, window_pattern=args.window_pattern)
+        if win is None:
+            sys.exit(f"launched {args.app_id!r} but no window appeared within {args.timeout}s")
+        print(f"{win.id}\t{win.classname}\t{win.title}")
+    else:
+        apps.launch(args.app_id)
 
 
 def _cmd_click(args: argparse.Namespace) -> None:
@@ -186,6 +192,18 @@ def build_parser() -> argparse.ArgumentParser:
 
     a = app_sub.add_parser("launch")
     a.add_argument("app_id")
+    a.add_argument(
+        "--wait", action="store_true",
+        help="block until a window for this app appears (useful for slow-starting apps)",
+    )
+    a.add_argument(
+        "--timeout", type=float, default=apps.DEFAULT_WAIT_TIMEOUT,
+        help=f"seconds to wait with --wait (default: {apps.DEFAULT_WAIT_TIMEOUT})",
+    )
+    a.add_argument(
+        "--window-pattern", default=None,
+        help="regex to match the new window against with --wait (default: app_id)",
+    )
     a.set_defaults(func=_cmd_apps_launch)
 
     click = sub.add_parser("click")

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import subprocess
+import time
 from dataclasses import dataclass
 
 
@@ -106,6 +107,22 @@ def search(pattern: str, by: str = "any", limit: int = 0) -> list[Window]:
 def find_one(pattern: str) -> Window | None:
     matches = search(pattern, limit=1)
     return matches[0] if matches else None
+
+
+def wait_for_window(pattern: str, timeout: float = 30.0, interval: float = 0.5) -> Window | None:
+    """Poll `search` until a window matching `pattern` appears, or `timeout` seconds pass.
+
+    Useful after launching a heavy app (video editor, IDE, office suite) instead of a
+    blind fixed sleep. Returns None on timeout rather than raising.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        win = find_one(pattern)
+        if win is not None:
+            return win
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(interval)
 
 
 def current_desktop() -> int:

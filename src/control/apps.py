@@ -7,6 +7,8 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
+from . import windows
+
 _APP_DIRS = [
     Path.home() / ".local/share/applications",
     Path("/usr/local/share/applications"),
@@ -58,13 +60,29 @@ def find(query: str) -> list[App]:
     return [a for a in list_apps() if q in a.name.lower() or q in a.app_id.lower()]
 
 
-def launch(app_id: str) -> subprocess.Popen:
-    """Launch by desktop-file id (e.g. 'org.kde.dolphin', 'firefox')."""
+DEFAULT_WAIT_TIMEOUT = 30.0  # seconds; heavy apps (video editors, IDEs, office suites) can be slow
+
+
+def launch(
+    app_id: str,
+    wait: bool = False,
+    timeout: float = DEFAULT_WAIT_TIMEOUT,
+    window_pattern: str | None = None,
+) -> subprocess.Popen | windows.Window | None:
+    """Launch by desktop-file id (e.g. 'org.kde.dolphin', 'firefox').
+
+    If `wait` is True, blocks (up to `timeout` seconds) polling window.py until a window
+    matching `window_pattern` (default: `app_id`) appears, and returns that Window instead
+    of firing-and-forgetting -- handy for heavy apps that take a while to show a window.
+    Returns None if `wait` is True but no matching window showed up before the timeout.
+    """
     result = subprocess.run(
         ["gtk-launch", app_id], capture_output=True, text=True, timeout=10
     )
     if result.returncode != 0:
         raise AppLaunchError(result.stderr.strip() or f"could not launch {app_id}")
+    if wait:
+        return windows.wait_for_window(window_pattern or app_id, timeout=timeout)
     return result
 
 

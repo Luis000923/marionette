@@ -14,3 +14,6 @@ wheels/
 .mypy_cache/
 .ruff_cache/
 *.pyc
+
+# Local secrets
+.env

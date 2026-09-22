@@ -92,6 +92,34 @@ def test_app_list_json_uses_find_when_query_given(capsys):
     mock_find.assert_called_once_with("fire")
 
 
+def test_app_launch_without_wait_does_not_poll_for_window():
+    parser = cli.build_parser()
+    args = parser.parse_args(["app", "launch", "firefox"])
+    assert args.wait is False
+    with patch("control.cli.apps.launch") as mock_launch:
+        args.func(args)
+    mock_launch.assert_called_once_with("firefox")
+
+
+def test_app_launch_with_wait_prints_window_info(capsys):
+    fake_win = windows.Window(id="9", title="Kdenlive", classname="kdenlive")
+    parser = cli.build_parser()
+    args = parser.parse_args(["app", "launch", "kdenlive", "--wait", "--timeout", "5"])
+    with patch("control.cli.apps.launch", return_value=fake_win) as mock_launch:
+        args.func(args)
+    mock_launch.assert_called_once_with("kdenlive", wait=True, timeout=5.0, window_pattern=None)
+    out = capsys.readouterr().out
+    assert out == "9\tkdenlive\tKdenlive\n"
+
+
+def test_app_launch_with_wait_exits_when_no_window_appears():
+    parser = cli.build_parser()
+    args = parser.parse_args(["app", "launch", "slow-app", "--wait"])
+    with patch("control.cli.apps.launch", return_value=None):
+        with pytest.raises(SystemExit):
+            args.func(args)
+
+
 class TestMainErrorHandling:
     def test_main_reports_kdotool_error_friendly(self, capsys):
         with patch("control.cli.build_parser") as mock_build:
