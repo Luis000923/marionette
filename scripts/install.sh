@@ -3,11 +3,17 @@
 set -euo pipefail
 
 if [[ $EUID -ne 0 ]]; then
-  echo "Run this with sudo: sudo ./scripts/install.sh" >&2
+  echo "Run this with sudo or pkexec: sudo ./scripts/install.sh" >&2
   exit 1
 fi
 
-REAL_USER="${SUDO_USER:-$USER}"
+if [[ -n "${SUDO_USER:-}" ]]; then
+  REAL_USER="$SUDO_USER"
+elif [[ -n "${PKEXEC_UID:-}" ]]; then
+  REAL_USER="$(id -un "$PKEXEC_UID")"
+else
+  REAL_USER="$USER"
+fi
 
 echo "==> Installing ydotool and kdotool"
 if command -v pacman >/dev/null 2>&1; then
@@ -47,20 +53,35 @@ else
   echo "(or just the systemctl/group steps below) once they're available."
 fi
 
-echo "==> Enabling ydotoold system service"
-if command -v ydotoold >/dev/null 2>&1 || systemctl list-unit-files 2>/dev/null | grep -q ydotoold; then
-  systemctl enable --now ydotoold.service
+echo "==> Loading the uinput kernel module"
+# The static /dev/uinput node exists from boot, but nothing had loaded the
+# module, so udev never got a uevent to apply its permission rule to it.
+modprobe uinput
+echo uinput > /etc/modules-load.d/uinput.conf
+
+echo "==> Granting $REAL_USER access to /dev/uinput"
+# This ydotool build has no system-wide ydotoold.service; it ships a udev rule
+# (GROUP=input, MODE=0660) plus a per-user systemd unit instead.
+usermod -aG input "$REAL_USER"
+udevadm control --reload-rules
+udevadm trigger --name-match=uinput
+sleep 0.5
+ls -la /dev/uinput
+
+echo "==> Enabling the ydotool user service for $REAL_USER"
+REAL_UID="$(id -u "$REAL_USER")"
+if [[ -S "/run/user/$REAL_UID/bus" ]]; then
+  sudo -u "$REAL_USER" XDG_RUNTIME_DIR="/run/user/$REAL_UID" \
+    systemctl --user enable --now ydotool.service
 else
-  echo "ydotoold not found; skipping service enable. Install ydotool first, then run:"
-  echo "  sudo systemctl enable --now ydotoold.service"
+  echo "No active user session bus for $REAL_USER (/run/user/$REAL_UID/bus missing)."
+  echo "Once logged in graphically, run this as $REAL_USER (not root):"
+  echo "  systemctl --user enable --now ydotool.service"
 fi
 
-echo "==> Granting $REAL_USER access to the ydotool socket"
-getent group ydotoold >/dev/null 2>&1 && usermod -aG ydotoold "$REAL_USER" || true
-
 echo
-echo "Done. If your user was just added to a new group, log out and back in"
-echo "(or run 'newgrp ydotoold') before ydotool commands will work without sudo."
+echo "Done. Your user was just added to the 'input' group: log out and back in"
+echo "(or run 'newgrp input') before ydotool commands will work without sudo."
 echo
 echo "If kdotool could not be installed automatically above, install it manually"
 echo "before using any 'control win ...' commands."

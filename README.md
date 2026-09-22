@@ -12,6 +12,54 @@ uv run playwright install chromium
 sudo ./scripts/install.sh   # installs ydotool/kdotool, enables ydotoold, group perms
 ```
 
+## Token efficiency for agents driving this tool
+
+See [AGENT_GUIDELINES.md](AGENT_GUIDELINES.md) for the five-rule quick reference.
+The rest of this section is the fuller narrative version of the same rules.
+
+An LLM agent (Claude Code or otherwise) issuing these commands pays tokens for
+everything it reads back — command output, and especially images. These habits
+keep that cost down without losing verification quality:
+
+1. **Skip `uv run`'s resolve step once the venv is synced.** `uv run control ...`
+   re-checks (and sometimes reinstalls) the local package on every invocation,
+   printing noise like `Building marionette... Uninstalled... Installed...`
+   before the real output. Call the synced venv's binary directly instead:
+
+   ```
+   /home/luis/Documentos/control/.venv/bin/control win list --json
+   ```
+
+   Same output, none of the resolver chatter. Re-run `uv sync` (or fall back to
+   `uv run`) only after actually changing dependencies.
+
+2. **Prefer state you can already read over a screenshot.** A screenshot costs
+   dramatically more tokens than text once it's read back as an image. Most
+   verifications don't need one:
+   - a window's title changing (`win list --json` before/after) proves an
+     action landed (see the Brave search-and-verify example above);
+   - a window disappearing from `win list --json` proves it closed;
+   - in the browser, `text_content()` / `control browser snapshot` (DOM text)
+     proves page state far more cheaply than a picture of the page.
+
+   Reach for `shot`/`browser screenshot` only when the *visual* layout itself
+   is what's being checked, not just "did the action happen".
+
+3. **When a screenshot is unavoidable, take the smallest one that answers the
+   question.** `shot window` (or `--window PATTERN`) instead of `shot full`;
+   crop to the region that matters instead of the whole desktop.
+
+4. **Let the tool filter, not the agent reading the output.** `win list brave`
+   instead of `win list ""` followed by scanning the full list yourself —
+   smaller output in, smaller output back.
+
+5. **Batch independent steps into one shell call.** Launch + wait + verify as
+   one `&&`-chained command instead of three separate tool round-trips, when
+   the steps don't depend on inspecting intermediate output.
+
+6. **Cache what you already queried.** Re-use a window's id/geometry from the
+   last `win list --json` instead of re-querying state that hasn't changed.
+
 ### Sudo password (optional)
 
 A few setup/repair tasks genuinely need root (restarting `ydotoold`, fixing `uinput`
@@ -77,10 +125,9 @@ To wait for a window you didn't launch (a dialog, say), use
 `control win wait PATTERN [--timeout S]`. It returns as soon as any matching window
 exists and focuses it.
 
-Tip for token-efficient automation: once you've located a window, prefer driving it
-with keyboard shortcuts (`control key ...`) and cached window state (id/geometry from
-`control win list --json`) over repeated screenshot-and-inspect round-trips — re-query
-the window only when you expect its state actually changed.
+See "Token efficiency for agents driving this tool" above — once you've located a
+window, prefer driving it with keyboard shortcuts (`control key ...`) and cached
+window state over repeated screenshot-and-inspect round-trips.
 
 ## Asking other AIs for a second opinion
 
