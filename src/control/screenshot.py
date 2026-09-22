@@ -1,6 +1,11 @@
-"""Screenshots via spectacle, KDE's native (Wayland-safe) screenshot tool."""
+"""Screenshots via spectacle, KDE's native (Wayland-safe) screenshot tool.
+
+With an active session (CONTROL_SESSION_ID) captures land in that session's own
+directory, so parallel agents never overwrite or pick up each other's images.
+"""
 from __future__ import annotations
 
+import os
 import subprocess
 import tempfile
 import time
@@ -24,8 +29,19 @@ def _capture(mode_flag: str, out_path: Path) -> Path:
     return out_path
 
 
+def output_dir() -> Path:
+    name = os.environ.get("CONTROL_SESSION_ID")
+    if not name:
+        return DEFAULT_DIR
+    from . import session as session_mod  # lazy: keep this module dependency-free
+
+    return session_mod.session_dir(name) / "screenshots"
+
+
 def _timestamped(prefix: str) -> Path:
-    return DEFAULT_DIR / f"{prefix}-{int(time.time() * 1000)}.png"
+    # pid in the name: two agents sharing a directory in the same millisecond
+    # must still get distinct files.
+    return output_dir() / f"{prefix}-{int(time.time() * 1000)}-{os.getpid()}.png"
 
 
 def fullscreen(out_path: Path | None = None) -> Path:

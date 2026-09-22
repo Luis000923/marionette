@@ -1,12 +1,31 @@
-"""Precise, DOM-level browser control via Playwright (persistent Chromium profile)."""
+"""Precise, DOM-level browser control via Playwright (persistent Chromium profile).
+
+When a session is active (CONTROL_SESSION_ID), the profile lives inside that
+session's directory instead of the shared one: parallel agents then keep
+separate cookies, logins and local storage, and Chromium never refuses to start
+because another instance already locked the profile.
+"""
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Optional
 
 from playwright.sync_api import BrowserContext, Page, sync_playwright
 
+#: Shared profile, used when no session is active (unchanged default).
 PROFILE_DIR = Path.home() / ".local/share/control/browser-profile"
+
+
+def profile_dir(session_name: str | None = None) -> Path:
+    """Profile directory for `session_name`, or the active session, or the shared one."""
+    name = session_name or os.environ.get("CONTROL_SESSION_ID") or ""
+    if not name:
+        return PROFILE_DIR
+    # Imported lazily: browser.py must stay importable without a KDE session.
+    from . import session as session_mod
+
+    return session_mod.session_dir(name) / "browser-profile"
 
 
 class Browser:
@@ -15,11 +34,12 @@ class Browser:
     Persistent context keeps cookies/logins across runs, like a normal browser profile.
     """
 
-    def __init__(self, headless: bool = False):
+    def __init__(self, headless: bool = False, profile: Path | str | None = None):
         self._playwright = sync_playwright().start()
-        PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+        self.profile = Path(profile) if profile is not None else profile_dir()
+        self.profile.mkdir(parents=True, exist_ok=True)
         self.context: BrowserContext = self._playwright.chromium.launch_persistent_context(
-            str(PROFILE_DIR), headless=headless, viewport=None,
+            str(self.profile), headless=headless, viewport=None,
         )
 
     @property

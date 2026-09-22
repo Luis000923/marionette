@@ -1,17 +1,18 @@
 """Non-interactive privilege escalation for the handful of setup tasks that need it
 (e.g. managing the ydotoold service, fixing uinput group membership).
 
-The password is read from the CONTROL_SUDO_PASSWORD env var (see .env.example) and
-piped to `sudo -S` over stdin -- it is never passed as a CLI argument or logged, since
-CLI arguments are visible to any other user via `ps`.
+The password (CONTROL_SUDO_PASSWORD, see .env.example) is read straight from the
+.env file via `env.get_secret` and piped to `sudo -S` over stdin. It is never passed
+as a CLI argument (visible to every user via `ps`), never logged, and never written
+to `os.environ` -- so it doesn't show up in `/proc/<pid>/environ` and isn't inherited
+by sudo or the command it runs.
 """
 from __future__ import annotations
 
-import os
 import subprocess
 from dataclasses import dataclass
 
-from .env import load_env
+from .env import EnvPermissionError, get_secret, scrubbed_environ
 
 
 class SudoError(RuntimeError):
@@ -32,10 +33,13 @@ class SudoResult:
 def run_as_root(command: list[str], timeout: int = 30) -> SudoResult:
     """Run `command` under `sudo -S`, feeding CONTROL_SUDO_PASSWORD via stdin.
 
-    Raises SudoError if CONTROL_SUDO_PASSWORD is unset (loading .env first if present).
+    Raises SudoError if CONTROL_SUDO_PASSWORD is unset, or if the .env holding it
+    is readable by other users.
     """
-    load_env()
-    password = os.environ.get("CONTROL_SUDO_PASSWORD")
+    try:
+        password = get_secret("CONTROL_SUDO_PASSWORD")
+    except EnvPermissionError as exc:
+        raise SudoError(str(exc)) from exc
     if not password:
         raise SudoError(
             "CONTROL_SUDO_PASSWORD is not set; copy .env.example to .env and set it"
@@ -46,6 +50,8 @@ def run_as_root(command: list[str], timeout: int = 30) -> SudoResult:
         capture_output=True,
         text=True,
         timeout=timeout,
+        # Even a password the user exported by hand must not leak to the child.
+        env=scrubbed_environ(),
     )
     return SudoResult(returncode=result.returncode, stdout=result.stdout, stderr=result.stderr)
 

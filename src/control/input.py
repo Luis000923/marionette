@@ -1,7 +1,33 @@
-"""Mouse and keyboard simulation for any Wayland compositor, via ydotool (uinput-based)."""
+"""Mouse and keyboard simulation for any Wayland compositor, via ydotool (uinput-based).
+
+`ydotoold` owns one global kernel `uinput` device, so concurrent agents would
+interleave their keystrokes and clicks. Every call here goes through the
+`input_mutex` (see locking.py), which serializes input across processes; the
+mutex is reentrant so composite gestures hold it for their whole sequence.
+"""
 from __future__ import annotations
 
 import subprocess
+from contextlib import contextmanager
+from typing import Iterator
+
+from .locking import FileMutex, LockTimeout  # noqa: F401 - LockTimeout re-exported for callers
+
+#: Process-wide handle on the global input lock.
+input_mutex = FileMutex()
+
+
+@contextmanager
+def input_lock(timeout: float | None = None) -> Iterator[FileMutex]:
+    """Hold the input mutex across several actions, so no other agent can cut in.
+
+    >>> with input_lock():
+    ...     click(100, 200)
+    ...     type_text("hello")
+    """
+    with input_mutex.acquired(timeout):
+        yield input_mutex
+
 
 # Linux input-event-codes.h keycodes for the keys we care about.
 # Extend this table as needed: https://github.com/torvalds/linux/blob/master/include/uapi/linux/input-event-codes.h
@@ -44,7 +70,8 @@ class YdotoolError(RuntimeError):
 
 
 def _run(*args: str) -> None:
-    result = subprocess.run(["ydotool", *args], capture_output=True, text=True, timeout=15)
+    with input_mutex:
+        result = subprocess.run(["ydotool", *args], capture_output=True, text=True, timeout=15)
     if result.returncode != 0:
         raise YdotoolError(
             f"ydotool {' '.join(args)} failed: {result.stderr.strip() or result.stdout.strip()}\n"
@@ -61,21 +88,26 @@ def move_mouse_relative(dx: int, dy: int) -> None:
 
 
 def click(button: str = "left", x: int | None = None, y: int | None = None) -> None:
-    if x is not None and y is not None:
-        move_mouse(x, y)
-    _run("click", _button_code(button, "click"))
+    with input_mutex:
+        if x is not None and y is not None:
+            move_mouse(x, y)
+        _run("click", _button_code(button, "click"))
 
 
 def double_click(button: str = "left", x: int | None = None, y: int | None = None) -> None:
-    click(button, x, y)
-    click(button)
+    with input_mutex:
+        click(button, x, y)
+        click(button)
 
 
 def drag(x1: int, y1: int, x2: int, y2: int, button: str = "left") -> None:
-    move_mouse(x1, y1)
-    _run("click", _button_code(button, "down"))
-    move_mouse(x2, y2)
-    _run("click", _button_code(button, "up"))
+    # The button must stay down for the whole gesture: never let another agent
+    # in between the press and the release.
+    with input_mutex:
+        move_mouse(x1, y1)
+        _run("click", _button_code(button, "down"))
+        move_mouse(x2, y2)
+        _run("click", _button_code(button, "up"))
 
 
 def scroll(amount: int) -> None:

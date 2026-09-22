@@ -1,200 +1,576 @@
-"""Unified CLI for desktop control: windows, input, screenshots, apps, browser."""
+"""Unified CLI for desktop control: windows, input, screenshots, apps, browser, sessions.
+
+Multi-agent use rests on four things wired up here:
+
+* `--session NAME` / `CONTROL_SESSION_ID` selects an agent's workspace, which
+  supplies the default `--desktop` for every window/app command;
+* `--desktop REF` takes a 1-based number or a desktop *name*; commands that
+  create things (`app launch`, `win send`) create a missing named desktop on the
+  fly, read-only queries never do;
+* `--env-file PATH` layers per-agent configuration on top of the repo `.env`;
+* input commands (`click`, `type`, `key`) accept `--window PATTERN`, which
+  focuses that window and sends the input while holding the global input lock,
+  so no other agent can steal focus in between.
+
+Every command is machine-readable: `--json` (anywhere on the command line) or
+`CONTROL_JSON=1` makes it print exactly one JSON value on stdout, and failures
+print `{"error": ..., "hint": ..., "type": ...}` on stdout with exit status 1
+(2 for usage errors). Plain text stays the default for humans.
+"""
 from __future__ import annotations
 
 import argparse
+import difflib
+import functools
 import json
+import os
 import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Callable
 
 from playwright.sync_api import Error as PlaywrightError
 
-from . import apps, input as inp, screenshot, windows
+from . import apps, env, input as inp, screenshot, session as session_mod, windows
 from .browser import Browser
+from .env import load_env
 
 
-def _cmd_win_list(args: argparse.Namespace) -> None:
-    results = windows.search(args.pattern or "")
-    if args.json:
-        print(json.dumps([
-            {"id": w.id, "title": w.title, "class": w.classname} for w in results
-        ]))
-        return
-    for w in results:
-        print(f"{w.id}\t{w.classname}\t{w.title}")
+# --- output plumbing ---------------------------------------------------------
+
+class CliError(SystemExit):
+    """A user-facing failure with a hint. Subclasses SystemExit so a handler
+    called directly (as the tests do) still stops with the message."""
+
+    def __init__(self, message: str, hint: str = "", kind: str = "cli_error"):
+        super().__init__(message)
+        self.message = message
+        self.hint = hint
+        self.kind = kind
 
 
-def _cmd_win_activate(args: argparse.Namespace) -> None:
-    win = windows.find_one(args.pattern)
+@dataclass
+class Out:
+    """What a command produced: `data` for --json, `text` for humans."""
+    data: Any
+    text: str | None = None
+
+
+def _truthy(value: str | None) -> bool:
+    return (value or "").lower() in ("1", "true", "yes")
+
+
+def _json_requested(argv: list[str] | None = None) -> bool:
+    """JSON mode before (or without) a parsed namespace, e.g. for usage errors."""
+    argv = sys.argv[1:] if argv is None else argv
+    return "--json" in argv or _truthy(os.environ.get("CONTROL_JSON"))
+
+
+def _json_mode(args: argparse.Namespace) -> bool:
+    # `is True`: a mocked namespace must not count as JSON mode.
+    return getattr(args, "json", False) is True or _truthy(os.environ.get("CONTROL_JSON"))
+
+
+def command(fn: Callable[[argparse.Namespace], Out | None]) -> Callable[[argparse.Namespace], None]:
+    """Turn a handler returning `Out` into one that prints it in the right format."""
+
+    @functools.wraps(fn)
+    def run(args: argparse.Namespace) -> None:
+        out = fn(args)
+        if out is None:
+            return
+        if _json_mode(args):
+            print(json.dumps(out.data, indent=2 if getattr(args, "pretty", False) else None))
+        elif out.text:
+            print(out.text)
+
+    return run
+
+
+def _ok(action: str, **fields: Any) -> dict:
+    return {"ok": True, "action": action, **fields}
+
+
+def _win_line(w: windows.Window) -> str:
+    return f"{w.id}\t{w.classname}\t{w.title}"
+
+
+def _desktop_dict(d: windows.Desktop, current: int | None = None) -> dict:
+    data = {"number": d.number, "position": d.position, "id": d.id, "name": d.name}
+    if current is not None:
+        data["current"] = d.number == current
+    return data
+
+
+# --- targeting ---------------------------------------------------------------
+
+def _desktop(args: argparse.Namespace, create: bool = False) -> int | None:
+    """Desktop a command should target: explicit --desktop, else the session's.
+
+    Numbers pass straight through (kdotool validates them). Names are resolved
+    through KWin, and created when `create` is set.
+    """
+    ref = getattr(args, "desktop", None)
+    if ref is not None:
+        ref = str(ref)
+        if ref.isdigit():
+            return int(ref)
+        return windows.resolve_desktop(ref, create=create).number
+    name = session_mod.current_name()
+    if name and session_mod.load(name) is None:
+        # Silently falling back to "all desktops" would let this agent act on
+        # every other agent's windows while believing it is sandboxed.
+        raise CliError(
+            f"session {name!r} is not initialised",
+            hint=f"run: control session init --name {name}", kind="session_error",
+        )
+    return session_mod.resolve_desktop(None)
+
+
+def _find_window(pattern: str, args: argparse.Namespace) -> windows.Window:
+    desktop = _desktop(args)
+    win = windows.find_one(pattern, desktop=desktop)
     if not win:
-        sys.exit(f"no window matching {args.pattern!r}")
-    win.activate()
+        scope = f" on desktop {desktop}" if desktop is not None else ""
+        raise CliError(
+            f"no window matching {pattern!r}{scope}",
+            hint="list candidates with: control win list --json",
+            kind="window_not_found",
+        )
+    if win.desktop is None:
+        win.desktop = desktop
+    return win
 
 
-def _cmd_win_close(args: argparse.Namespace) -> None:
-    win = windows.find_one(args.pattern)
-    if not win:
-        sys.exit(f"no window matching {args.pattern!r}")
-    win.close()
+def _require_window(args: argparse.Namespace) -> windows.Window:
+    return _find_window(args.pattern, args)
 
 
-def _cmd_win_move(args: argparse.Namespace) -> None:
-    win = windows.find_one(args.pattern)
-    if not win:
-        sys.exit(f"no window matching {args.pattern!r}")
-    win.move(args.x, args.y)
+def _focused_input(args: argparse.Namespace, action: str, send: Callable[[], None],
+                   **fields: Any) -> Out:
+    """Run `send` under the input lock, first focusing --window if one was given.
+
+    Focus is as global as uinput: if agent A activated its window and then
+    released the lock before typing, agent B could activate its own in between
+    and A's keystrokes would land in B's window. Holding one lock across
+    "focus + input" makes the pair atomic.
+    """
+    with inp.input_lock():
+        win = None
+        if getattr(args, "window", None):
+            win = _find_window(args.window, args)
+            if not win.focus():
+                raise CliError(
+                    f"window {win.id} ({win.title!r}) did not take focus",
+                    hint="KWin focus-stealing prevention may be blocking it; "
+                         "try 'control win activate' first",
+                    kind="focus_error",
+                )
+        send()
+    data = _ok(action, **fields)
+    if win is not None:
+        data["window"] = win.to_dict()
+    return Out(data)
 
 
-def _cmd_win_resize(args: argparse.Namespace) -> None:
-    win = windows.find_one(args.pattern)
-    if not win:
-        sys.exit(f"no window matching {args.pattern!r}")
-    win.resize(args.width, args.height)
+# --- windows -----------------------------------------------------------------
+
+@command
+def _cmd_win_list(args: argparse.Namespace) -> Out:
+    results = windows.list_windows(args.pattern or "", desktop=_desktop(args))
+    return Out([w.to_dict() for w in results], "\n".join(_win_line(w) for w in results))
 
 
-def _cmd_shot(args: argparse.Namespace) -> None:
+@command
+def _cmd_win_active(args: argparse.Namespace) -> Out:
+    win = windows.active_window()
+    return Out(win.to_dict(), _win_line(win))
+
+
+def _window_action(name: str, act: Callable[[windows.Window, argparse.Namespace], None]):
+    @command
+    def run(args: argparse.Namespace) -> Out:
+        win = _require_window(args)
+        act(win, args)
+        return Out(_ok(name, window=win.to_dict()))
+
+    run.__name__ = f"_cmd_win_{name}"
+    return run
+
+
+_cmd_win_activate = _window_action("activate", lambda w, a: w.activate())
+_cmd_win_close = _window_action("close", lambda w, a: w.close())
+_cmd_win_move = _window_action("move", lambda w, a: w.move(a.x, a.y))
+_cmd_win_resize = _window_action("resize", lambda w, a: w.resize(a.width, a.height))
+
+
+@command
+def _cmd_win_send(args: argparse.Namespace) -> Out:
+    """Move a matching window onto another virtual desktop (created if named and missing)."""
+    win = _require_window(args)
+    target = str(args.target)
+    number = int(target) if target.isdigit() else windows.resolve_desktop(target, create=True).number
+    win.move_to_desktop(number)
+    return Out(_ok("send", window=win.to_dict(), desktop=number), f"{win.id}\t-> desktop {number}")
+
+
+@command
+def _cmd_win_wait(args: argparse.Namespace) -> Out:
+    win = windows.wait_for_window(
+        args.pattern, timeout=args.timeout, desktop=_desktop(args),
+        activate=not args.no_activate,
+    )
+    if win is None:
+        raise CliError(
+            f"no window matching {args.pattern!r} within {args.timeout}s",
+            hint="raise --timeout, or check the pattern with: control win list --json",
+            kind="timeout",
+        )
+    return Out(win.to_dict(), _win_line(win))
+
+
+# --- screenshots ---------------------------------------------------------------
+
+@command
+def _cmd_shot(args: argparse.Namespace) -> Out:
     fn = {"full": screenshot.fullscreen, "window": screenshot.active_window,
           "region": screenshot.region}[args.mode]
-    path = fn()
-    print(path)
-
-
-def _cmd_apps_list(args: argparse.Namespace) -> None:
-    found = apps.find(args.query) if args.query else apps.list_apps()
-    if args.json:
-        print(json.dumps([{"id": a.app_id, "name": a.name} for a in found]))
-        return
-    for a in found:
-        print(f"{a.app_id}\t{a.name}")
-
-
-def _cmd_apps_launch(args: argparse.Namespace) -> None:
-    if args.wait:
-        win = apps.launch(args.app_id, wait=True, timeout=args.timeout, window_pattern=args.window_pattern)
-        if win is None:
-            sys.exit(f"launched {args.app_id!r} but no window appeared within {args.timeout}s")
-        print(f"{win.id}\t{win.classname}\t{win.title}")
+    data: dict[str, Any] = {"mode": args.mode}
+    if args.window:
+        # "window" mode captures whatever is focused, so focus + capture must
+        # not be split by another agent's activation.
+        with inp.input_lock():
+            win = _find_window(args.window, args)
+            win.focus()
+            path = fn()
+        data["window"] = win.to_dict()
     else:
+        path = fn()
+    data["path"] = str(path)
+    return Out(data, str(path))
+
+
+# --- apps --------------------------------------------------------------------
+
+@command
+def _cmd_apps_list(args: argparse.Namespace) -> Out:
+    found = apps.find(args.query) if args.query else apps.list_apps()
+    return Out([{"id": a.app_id, "name": a.name} for a in found],
+               "\n".join(f"{a.app_id}\t{a.name}" for a in found))
+
+
+@command
+def _cmd_apps_launch(args: argparse.Namespace) -> Out:
+    desktop = _desktop(args, create=True)
+    if not (args.wait or desktop is not None):
         apps.launch(args.app_id)
+        return Out(_ok("launch", app_id=args.app_id, window=None))
+    win = apps.launch(
+        args.app_id, wait=True, timeout=args.timeout,
+        window_pattern=args.window_pattern, desktop=desktop,
+        activate=not args.no_activate,
+    )
+    if win is None:
+        raise CliError(
+            f"launched {args.app_id!r} but no new window appeared within {args.timeout}s",
+            hint="raise --timeout, or pass --window-pattern matching the window's title/class",
+            kind="timeout",
+        )
+    return Out(_ok("launch", app_id=args.app_id, window=win.to_dict()), _win_line(win))
 
 
-def _cmd_click(args: argparse.Namespace) -> None:
-    inp.click(args.button, args.x, args.y)
+# --- input -------------------------------------------------------------------
+
+@command
+def _cmd_click(args: argparse.Namespace) -> Out:
+    return _focused_input(args, "click", lambda: inp.click(args.button, args.x, args.y),
+                          button=args.button, x=args.x, y=args.y)
 
 
-def _cmd_type(args: argparse.Namespace) -> None:
-    inp.type_text(args.text)
+@command
+def _cmd_type(args: argparse.Namespace) -> Out:
+    text = sys.stdin.read() if args.text == "-" else args.text
+    # Only the length is echoed back: the text may be a password, and repeating
+    # it would cost the agent tokens for nothing.
+    return _focused_input(args, "type", lambda: inp.type_text(text, delay_ms=args.delay),
+                          chars=len(text))
 
 
-def _cmd_key(args: argparse.Namespace) -> None:
-    inp.key_combo(*args.keys)
+@command
+def _cmd_key(args: argparse.Namespace) -> Out:
+    unknown = [k for k in args.keys if k.lower() not in inp.KEYCODES]
+    if unknown:
+        suggestions = difflib.get_close_matches(unknown[0].lower(), inp.KEYCODES, n=3)
+        raise CliError(
+            f"unknown key name(s): {', '.join(unknown)}",
+            hint=f"did you mean: {', '.join(suggestions)}" if suggestions
+            else "see input.KEYCODES for valid names",
+            kind="unknown_key",
+        )
+    return _focused_input(args, "key", lambda: inp.key_combo(*args.keys), keys=args.keys)
+
+
+# --- virtual desktops & sessions: the multi-agent orchestration surface ---
+
+@command
+def _cmd_desktop_list(args: argparse.Namespace) -> Out:
+    desktops = windows.list_desktops()
+    current = windows.current_desktop()
+    lines = [f"{'*' if d.number == current else ' '} {d.number}\t{d.name}\t{d.id}"
+             for d in desktops]
+    return Out([_desktop_dict(d, current) for d in desktops], "\n".join(lines))
+
+
+@command
+def _cmd_desktop_create(args: argparse.Namespace) -> Out:
+    desktop = windows.ensure_desktop(args.name) if args.ensure else windows.create_desktop(
+        args.name, position=args.position
+    )
+    return Out(_desktop_dict(desktop), f"{desktop.number}\t{desktop.name}\t{desktop.id}")
+
+
+@command
+def _cmd_desktop_remove(args: argparse.Namespace) -> Out:
+    windows.remove_desktop(args.desktop)
+    return Out(_ok("remove", desktop=args.desktop))
+
+
+@command
+def _cmd_desktop_current(args: argparse.Namespace) -> Out:
+    current = windows.current_desktop()
+    return Out({"current": current}, str(current))
+
+
+@command
+def _cmd_desktop_switch(args: argparse.Namespace) -> Out:
+    ref = str(args.desktop)
+    number = int(ref) if ref.isdigit() else windows.resolve_desktop(ref).number
+    windows.set_desktop(number)
+    return Out(_ok("switch", desktop=number))
+
+
+@command
+def _cmd_session_init(args: argparse.Namespace) -> Out:
+    session = session_mod.init(
+        args.name, desktop=args.desktop, desktop_name=args.desktop_name,
+        activate=args.activate,
+    )
+    text = "\n".join([
+        f"session {session.name} ready on desktop {session.desktop} ({session.desktop_name})",
+        f"  state:   {session.dir}",
+        f"  profile: {session.profile_dir}",
+        f"  export CONTROL_SESSION_ID={session.name}",
+    ])
+    return Out(session.to_dict(), text)
+
+
+@command
+def _cmd_session_status(args: argparse.Namespace) -> Out:
+    state = session_mod.status(include_windows=not args.no_windows)
+    if not state["sessions"]:
+        return Out(state, "no sessions (create one with: control session init --name agent_1)")
+    lines = []
+    for entry in state["sessions"]:
+        marker = "*" if entry["active"] else " "
+        missing = "" if entry["desktop_exists"] else " (desktop gone)"
+        lines.append(f"{marker} {entry['name']}\tdesktop {entry['desktop']}{missing}\t"
+                     f"{len(entry['windows'])} window(s)")
+        lines += [f"    {w['id']}\t{w['class']}\t{w['title']}" for w in entry["windows"]]
+    return Out(state, "\n".join(lines))
+
+
+@command
+def _cmd_session_list(args: argparse.Namespace) -> Out:
+    sessions = session_mod.list_sessions()
+    return Out([s.to_dict() for s in sessions],
+               "\n".join(f"{s.name}\t{s.desktop}\t{s.desktop_name}" for s in sessions))
+
+
+@command
+def _cmd_session_end(args: argparse.Namespace) -> Out:
+    session_mod.end(args.name, remove_desktop=args.remove_desktop)
+    return Out(_ok("end", session=args.name, desktop_removed=args.remove_desktop))
+
+
+@command
+def _cmd_snapshot(args: argparse.Namespace) -> Out:
+    """Whole-desktop state in one non-blocking pass (always JSON)."""
+    state = session_mod.status(include_windows=not args.no_windows)
+    state["windows"] = [
+        w.to_dict() for w in windows.list_windows("", desktop=_desktop(args))
+    ]
+    state["current_desktop"] = windows.current_desktop()
+    return Out(state, json.dumps(state, indent=2 if args.pretty else None))
 
 
 # --- browser: small functions that take a Browser/Page so they're testable
 # without actually launching a real Chromium context. ---
 
-def browser_goto(browser: Browser, url: str) -> str:
+def _page(browser: Browser):
+    return browser.active_tab() or browser.new_tab()
+
+
+def browser_goto(browser: Browser, url: str) -> dict:
     page = browser.goto(url)
-    return page.url
+    return {"url": page.url, "title": page.title()}
 
 
-def browser_click(browser: Browser, selector: str) -> str:
+def browser_click(browser: Browser, selector: str) -> dict:
     browser.click(selector)
-    return f"clicked {selector!r}"
+    return _ok("click", selector=selector)
 
 
-def browser_fill(browser: Browser, selector: str, text: str) -> str:
+def browser_fill(browser: Browser, selector: str, text: str) -> dict:
     browser.fill(selector, text)
-    return f"filled {selector!r}"
+    return _ok("fill", selector=selector, chars=len(text))
 
 
-def browser_eval(browser: Browser, expression: str) -> str:
-    page = browser.active_tab()
-    if page is None:
-        page = browser.new_tab()
-    result = page.evaluate(expression)
-    return json.dumps(result) if not isinstance(result, str) else result
+def browser_eval(browser: Browser, expression: str) -> dict:
+    return {"result": _page(browser).evaluate(expression)}
 
 
-def browser_snapshot(browser: Browser) -> str:
-    page = browser.active_tab()
-    if page is None:
-        page = browser.new_tab()
-    return page.inner_text("body")
+def browser_snapshot(browser: Browser) -> dict:
+    page = _page(browser)
+    return {"url": page.url, "text": page.inner_text("body")}
 
 
-def _cmd_browser_goto(args: argparse.Namespace) -> None:
-    with Browser(headless=args.headless) as b:
-        print(browser_goto(b, args.url))
+def _browser_command(run: Callable[[Browser, argparse.Namespace], dict],
+                     text: Callable[[dict], str]):
+    @command
+    def handler(args: argparse.Namespace) -> Out:
+        with Browser(headless=args.headless) as b:
+            data = run(b, args)
+        data["profile"] = str(b.profile)
+        return Out(data, text(data))
+
+    return handler
 
 
-def _cmd_browser_click(args: argparse.Namespace) -> None:
-    with Browser(headless=args.headless) as b:
-        print(browser_click(b, args.selector))
+def _eval_text(data: dict) -> str:
+    result = data["result"]
+    return result if isinstance(result, str) else json.dumps(result)
 
 
-def _cmd_browser_fill(args: argparse.Namespace) -> None:
-    with Browser(headless=args.headless) as b:
-        print(browser_fill(b, args.selector, args.text))
+_cmd_browser_goto = _browser_command(lambda b, a: browser_goto(b, a.url), lambda d: d["url"])
+_cmd_browser_click = _browser_command(lambda b, a: browser_click(b, a.selector),
+                                      lambda d: f"clicked {d['selector']!r}")
+_cmd_browser_fill = _browser_command(lambda b, a: browser_fill(b, a.selector, a.text),
+                                     lambda d: f"filled {d['selector']!r}")
+_cmd_browser_eval = _browser_command(lambda b, a: browser_eval(b, a.expression), _eval_text)
+_cmd_browser_snapshot = _browser_command(lambda b, a: browser_snapshot(b), lambda d: d["text"])
 
 
-def _cmd_browser_eval(args: argparse.Namespace) -> None:
-    with Browser(headless=args.headless) as b:
-        print(browser_eval(b, args.expression))
+# --- parser ------------------------------------------------------------------
 
+class _Parser(argparse.ArgumentParser):
+    """ArgumentParser whose usage errors are JSON too when JSON was asked for."""
 
-def _cmd_browser_snapshot(args: argparse.Namespace) -> None:
-    with Browser(headless=args.headless) as b:
-        print(browser_snapshot(b))
+    def error(self, message: str):  # type: ignore[override]
+        if _json_requested():
+            print(json.dumps({"error": message, "hint": f"see: {self.prog} --help",
+                              "type": "usage_error"}))
+            sys.exit(2)
+        super().error(message)
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="control", description="Full desktop control for KDE/Wayland")
+    p = _Parser(prog="control", description="Full desktop control for KDE/Wayland")
+    p.add_argument(
+        "--session", default=None, metavar="NAME",
+        help="act as this agent session (same as CONTROL_SESSION_ID): scopes window "
+             "commands to its virtual desktop and uses its browser profile",
+    )
+    p.add_argument(
+        "--env-file", default=None, metavar="PATH",
+        help="load this .env before running (per-agent config; overrides the repo .env)",
+    )
+    p.add_argument(
+        "--json", action="store_true", default=False,
+        help="machine-readable output for every command, errors included "
+             "(also accepted after the subcommand, or via CONTROL_JSON=1)",
+    )
     sub = p.add_subparsers(dest="command", required=True)
+
+    def leaf(parent, name: str, func, **kwargs) -> argparse.ArgumentParser:
+        parser = parent.add_parser(name, **kwargs)
+        # SUPPRESS: when absent here, the top-level --json value is kept.
+        parser.add_argument("--json", action="store_true", default=argparse.SUPPRESS,
+                            help="output JSON instead of text")
+        parser.set_defaults(func=func)
+        return parser
+
+    def add_desktop_option(parser: argparse.ArgumentParser, creates: bool = False) -> None:
+        extra = "; a missing name is created" if creates else ""
+        parser.add_argument(
+            "--desktop", default=None, metavar="N|NAME",
+            help="only act on this virtual desktop (1-based number or name"
+                 f"{extra}); defaults to the active session's desktop, or all "
+                 "desktops when there is none",
+        )
+
+    def add_window_option(parser: argparse.ArgumentParser) -> None:
+        parser.add_argument(
+            "--window", default=None, metavar="PATTERN",
+            help="focus the first window matching PATTERN first; focus and input "
+                 "happen under one input lock, so no other agent can cut in",
+        )
+        add_desktop_option(parser)
 
     win = sub.add_parser("win", help="window management")
     win_sub = win.add_subparsers(dest="win_command", required=True)
 
-    w = win_sub.add_parser("list", help="list windows matching a pattern (default: all)")
+    w = leaf(win_sub, "list", _cmd_win_list, help="list windows matching a pattern (default: all)")
     w.add_argument("pattern", nargs="?", default="")
-    w.add_argument("--json", action="store_true", help="output a JSON array instead of tab-separated text")
-    w.set_defaults(func=_cmd_win_list)
+    add_desktop_option(w)
 
-    w = win_sub.add_parser("activate")
-    w.add_argument("pattern")
-    w.set_defaults(func=_cmd_win_activate)
+    leaf(win_sub, "active", _cmd_win_active, help="the currently focused window")
 
-    w = win_sub.add_parser("close")
-    w.add_argument("pattern")
-    w.set_defaults(func=_cmd_win_close)
+    for name, func in (("activate", _cmd_win_activate), ("close", _cmd_win_close)):
+        w = leaf(win_sub, name, func)
+        w.add_argument("pattern")
+        add_desktop_option(w)
 
-    w = win_sub.add_parser("move")
+    w = leaf(win_sub, "move", _cmd_win_move)
     w.add_argument("pattern")
     w.add_argument("x")
     w.add_argument("y")
-    w.set_defaults(func=_cmd_win_move)
+    add_desktop_option(w)
 
-    w = win_sub.add_parser("resize")
+    w = leaf(win_sub, "resize", _cmd_win_resize)
     w.add_argument("pattern")
     w.add_argument("width")
     w.add_argument("height")
-    w.set_defaults(func=_cmd_win_resize)
+    add_desktop_option(w)
 
-    shot = sub.add_parser("shot", help="take a screenshot")
+    w = leaf(win_sub, "send", _cmd_win_send, help="move a window to another virtual desktop")
+    w.add_argument("pattern")
+    w.add_argument("target", help="destination desktop: 1-based number, or a name "
+                                  "(created if it doesn't exist)")
+    add_desktop_option(w)
+
+    w = leaf(win_sub, "wait", _cmd_win_wait,
+             help="block until a window matching PATTERN exists, then focus it")
+    w.add_argument("pattern")
+    w.add_argument("--timeout", type=float, default=apps.DEFAULT_WAIT_TIMEOUT)
+    w.add_argument("--no-activate", action="store_true", help="don't focus the window found")
+    add_desktop_option(w)
+
+    shot = leaf(sub, "shot", _cmd_shot, help="take a screenshot")
     shot.add_argument("mode", choices=["full", "window", "region"], default="full", nargs="?")
-    shot.set_defaults(func=_cmd_shot)
+    add_window_option(shot)
 
     app = sub.add_parser("app", help="find/launch applications")
     app_sub = app.add_subparsers(dest="app_command", required=True)
 
-    a = app_sub.add_parser("list")
+    a = leaf(app_sub, "list", _cmd_apps_list)
     a.add_argument("query", nargs="?", default="")
-    a.add_argument("--json", action="store_true", help="output a JSON array instead of tab-separated text")
-    a.set_defaults(func=_cmd_apps_list)
 
-    a = app_sub.add_parser("launch")
+    a = leaf(app_sub, "launch", _cmd_apps_launch)
     a.add_argument("app_id")
     a.add_argument(
         "--wait", action="store_true",
-        help="block until a window for this app appears (useful for slow-starting apps)",
+        help="block until a *new* window for this app appears (pre-existing ones "
+             "are ignored), then focus it",
     )
     a.add_argument(
         "--timeout", type=float, default=apps.DEFAULT_WAIT_TIMEOUT,
@@ -204,20 +580,23 @@ def build_parser() -> argparse.ArgumentParser:
         "--window-pattern", default=None,
         help="regex to match the new window against with --wait (default: app_id)",
     )
-    a.set_defaults(func=_cmd_apps_launch)
+    a.add_argument("--no-activate", action="store_true",
+                   help="leave focus where it is once the window appears")
+    add_desktop_option(a, creates=True)
 
-    click = sub.add_parser("click")
+    click = leaf(sub, "click", _cmd_click)
     click.add_argument("--button", default="left", choices=["left", "right", "middle"])
     click.add_argument("-x", type=int, default=None)
     click.add_argument("-y", type=int, default=None)
-    click.set_defaults(func=_cmd_click)
+    add_window_option(click)
 
-    typ = sub.add_parser("type")
-    typ.add_argument("text")
-    typ.set_defaults(func=_cmd_type)
+    typ = leaf(sub, "type", _cmd_type)
+    typ.add_argument("text", help="text to type, or '-' to read it from stdin")
+    typ.add_argument("--delay", type=int, default=0, metavar="MS", help="delay between keys")
+    add_window_option(typ)
 
-    key = sub.add_parser(
-        "key",
+    key = leaf(
+        sub, "key", _cmd_key,
         help="press a key or key combo",
         description=(
             "Press one or more keys together, in order, then release in reverse order. "
@@ -232,34 +611,81 @@ def build_parser() -> argparse.ArgumentParser:
         "keys", nargs="+",
         help="one or more key names (see input.KEYCODES), e.g. ctrl shift t",
     )
-    key.set_defaults(func=_cmd_key)
+    add_window_option(key)
+
+    desktop = sub.add_parser("desktop", help="KDE virtual desktops (create/remove/switch)")
+    desktop_sub = desktop.add_subparsers(dest="desktop_command", required=True)
+
+    leaf(desktop_sub, "list", _cmd_desktop_list)
+
+    d = leaf(desktop_sub, "create", _cmd_desktop_create, help="create a virtual desktop on demand")
+    d.add_argument("name")
+    d.add_argument("--position", type=int, default=None,
+                   help="0-based insert position (default: append at the end)")
+    d.add_argument("--ensure", action="store_true",
+                   help="reuse an existing desktop with this name instead of failing")
+
+    d = leaf(desktop_sub, "remove", _cmd_desktop_remove)
+    d.add_argument("desktop", help="desktop name or 1-based number")
+
+    leaf(desktop_sub, "current", _cmd_desktop_current)
+
+    d = leaf(desktop_sub, "switch", _cmd_desktop_switch)
+    d.add_argument("desktop", metavar="N|NAME", help="desktop number (1-based) or name")
+
+    sess = sub.add_parser("session", help="multi-agent workspaces (one desktop + profile each)")
+    sess_sub = sess.add_subparsers(dest="session_command", required=True)
+
+    sc = leaf(sess_sub, "init", _cmd_session_init, help="prepare (or re-attach to) an agent workspace")
+    sc.add_argument("--name", required=True)
+    sc.add_argument("--desktop", default=None, metavar="N|NAME",
+                    help="pin to this desktop (number, or name -- created if missing) "
+                         "instead of creating control:<name>")
+    sc.add_argument("--desktop-name", default=None,
+                    help="name for the created desktop (default: control:<name>)")
+    sc.add_argument("--activate", action="store_true", help="switch to the desktop now")
+
+    sc = leaf(sess_sub, "status", _cmd_session_status, help="which agent owns which desktop and windows")
+    sc.add_argument("--no-windows", action="store_true", help="skip the per-desktop window query")
+
+    leaf(sess_sub, "list", _cmd_session_list)
+
+    sc = leaf(sess_sub, "end", _cmd_session_end, help="forget a session (its profile and log are kept)")
+    sc.add_argument("--name", required=True)
+    sc.add_argument("--remove-desktop", action="store_true",
+                    help="also delete the session's virtual desktop")
+
+    snap = leaf(
+        sub, "snapshot", _cmd_snapshot,
+        help="full desktop state as JSON (desktops, sessions, windows) -- non-blocking",
+    )
+    snap.add_argument("--pretty", action="store_true")
+    snap.add_argument("--no-windows", action="store_true", help="skip per-session window queries")
+    add_desktop_option(snap)
 
     browser = sub.add_parser("browser", help="DOM-precise browser control (Playwright/Chromium)")
     browser.add_argument("--headless", action="store_true", help="run Chromium headless")
     browser_sub = browser.add_subparsers(dest="browser_command", required=True)
 
-    b = browser_sub.add_parser("goto", help="navigate the active tab to a URL")
+    b = leaf(browser_sub, "goto", _cmd_browser_goto, help="navigate the active tab to a URL")
     b.add_argument("url")
-    b.set_defaults(func=_cmd_browser_goto)
 
-    b = browser_sub.add_parser("click", help="click an element by CSS selector")
+    b = leaf(browser_sub, "click", _cmd_browser_click, help="click an element by CSS selector")
     b.add_argument("selector")
-    b.set_defaults(func=_cmd_browser_click)
 
-    b = browser_sub.add_parser("fill", help="fill a form field by CSS selector")
+    b = leaf(browser_sub, "fill", _cmd_browser_fill, help="fill a form field by CSS selector")
     b.add_argument("selector")
     b.add_argument("text")
-    b.set_defaults(func=_cmd_browser_fill)
 
-    b = browser_sub.add_parser("eval", help="evaluate a JS expression on the active page")
+    b = leaf(browser_sub, "eval", _cmd_browser_eval, help="evaluate a JS expression on the active page")
     b.add_argument("expression")
-    b.set_defaults(func=_cmd_browser_eval)
 
-    b = browser_sub.add_parser("snapshot", help="dump the visible text of the active page")
-    b.set_defaults(func=_cmd_browser_snapshot)
+    leaf(browser_sub, "snapshot", _cmd_browser_snapshot, help="dump the visible text of the active page")
 
     return p
 
+
+# --- entry point -------------------------------------------------------------
 
 def _snake_case(name: str) -> str:
     out = []
@@ -272,26 +698,109 @@ def _snake_case(name: str) -> str:
 
 _ERROR_HINTS: dict[type, str] = {
     windows.KdotoolError: "check that kdotool is installed and KWin scripting is enabled",
+    windows.DesktopError: "list desktops with 'control desktop list' (KWin's D-Bus API must be reachable)",
     inp.YdotoolError: "check ydotoold is running: systemctl status ydotoold",
+    inp.LockTimeout: (
+        "another control process held the input lock too long; check with "
+        "'control session status', or raise CONTROL_INPUT_LOCK_TIMEOUT"
+    ),
+    session_mod.SessionError: "list known sessions with: control session list",
     apps.AppLaunchError: "check the app id with: control app list",
+    screenshot.ScreenshotError: "check that spectacle is installed and works: spectacle -b -n -f",
+    env.EnvPermissionError: "restrict the file to its owner: chmod 600 <file>",
     PlaywrightError: "browser action failed; check the selector/URL and that the page finished loading",
 }
+
+
+def _hint_for(exc: BaseException) -> str:
+    for klass in type(exc).__mro__:
+        if klass in _ERROR_HINTS:
+            return _ERROR_HINTS[klass]
+    return ""
+
+
+def _report(args: argparse.Namespace | None, kind: str, message: str, hint: str) -> None:
+    if (args is not None and _json_mode(args)) or (args is None and _json_requested()):
+        print(json.dumps({"error": message, "hint": hint, "type": kind}))
+    else:
+        suffix = f" ({hint})" if hint else ""
+        print(f"[ERROR] {kind}: {message}{suffix}", file=sys.stderr)
+
+
+def bootstrap(args: argparse.Namespace) -> None:
+    """Apply the global --session/--env-file options before any command runs.
+
+    Env precedence, highest first: variables already exported in the shell, the
+    explicit --env-file, the active session's own .env, then the repo .env. That
+    ordering lets each agent terminal override shared defaults without editing
+    (or racing on) the repo-level file. Secrets in any of them stay out of
+    os.environ (see env.py).
+    """
+    if getattr(args, "session", None):
+        os.environ["CONTROL_SESSION_ID"] = args.session
+    if getattr(args, "env_file", None):
+        path = Path(args.env_file)
+        if not path.is_file():
+            raise CliError(f"env file not found: {path}", hint="check the --env-file path",
+                           kind="env_file_not_found")
+        load_env(path, override=True)
+    name = session_mod.current_name()
+    if name:
+        session_env = session_mod.session_dir(name) / ".env"
+        if session_env.is_file():
+            load_env(session_env)
+    load_env()
+
+
+def _command_path(args: argparse.Namespace) -> str:
+    top = str(getattr(args, "command", "?"))
+    return " ".join(filter(None, [top, str(getattr(args, f"{top}_command", "") or "")]))
+
+
+def _trace(args: argparse.Namespace, outcome: str) -> None:
+    """One line per command in the session's own log, so agents' traces never mix.
+
+    Only the command path and outcome are logged -- never arguments, which can
+    hold typed text or form contents.
+    """
+    name = session_mod.current_name()
+    if not name:
+        return
+    try:
+        session = session_mod.load(name)
+        if session is not None:
+            session.log(f"{_command_path(args)} -> {outcome}")
+    except OSError:
+        pass
 
 
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
     try:
+        bootstrap(args)
         args.func(args)
+    except CliError as exc:
+        _report(args, exc.kind, exc.message, exc.hint)
+        _trace(args, exc.kind)
+        sys.exit(1)
     except SystemExit:
         raise
     except tuple(_ERROR_HINTS) as exc:
-        hint = _ERROR_HINTS[type(exc)]
-        print(f"[ERROR] {_snake_case(type(exc).__name__)}: {exc} ({hint})", file=sys.stderr)
+        kind = _snake_case(type(exc).__name__)
+        _report(args, kind, str(exc), _hint_for(exc))
+        _trace(args, kind)
         sys.exit(1)
     except Exception as exc:  # noqa: BLE001 - deliberately broad, but reported not hidden
+        _trace(args, "unexpected")
+        if _json_mode(args) and not _truthy(os.environ.get("CONTROL_DEBUG")):
+            _report(args, "unexpected", f"{type(exc).__name__}: {exc}",
+                    "set CONTROL_DEBUG=1 to get the traceback")
+            sys.exit(1)
         print(f"[ERROR] unexpected: {exc}", file=sys.stderr)
         raise
+    else:
+        _trace(args, "ok")
 
 
 if __name__ == "__main__":

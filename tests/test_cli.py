@@ -38,9 +38,9 @@ def test_win_list_plain_output(capsys):
     fake_windows = [windows.Window(id="1", title="Term", classname="konsole")]
     parser = cli.build_parser()
     args = parser.parse_args(["win", "list"])
-    with patch("control.cli.windows.search", return_value=fake_windows) as mock_search:
+    with patch("control.cli.windows.list_windows", return_value=fake_windows) as mock_list:
         args.func(args)
-    mock_search.assert_called_once_with("")
+    mock_list.assert_called_once_with("", desktop=None)
     out = capsys.readouterr().out
     assert out == "1\tkonsole\tTerm\n"
 
@@ -52,13 +52,13 @@ def test_win_list_json_output(capsys):
     ]
     parser = cli.build_parser()
     args = parser.parse_args(["win", "list", "--json"])
-    with patch("control.cli.windows.search", return_value=fake_windows):
+    with patch("control.cli.windows.list_windows", return_value=fake_windows):
         args.func(args)
     out = capsys.readouterr().out
     data = json.loads(out)
     assert data == [
-        {"id": "1", "title": "Term", "class": "konsole"},
-        {"id": "2", "title": "Files", "class": "dolphin"},
+        {"id": "1", "title": "Term", "class": "konsole", "desktop": None},
+        {"id": "2", "title": "Files", "class": "dolphin", "desktop": None},
     ]
 
 
@@ -107,7 +107,10 @@ def test_app_launch_with_wait_prints_window_info(capsys):
     args = parser.parse_args(["app", "launch", "kdenlive", "--wait", "--timeout", "5"])
     with patch("control.cli.apps.launch", return_value=fake_win) as mock_launch:
         args.func(args)
-    mock_launch.assert_called_once_with("kdenlive", wait=True, timeout=5.0, window_pattern=None)
+    mock_launch.assert_called_once_with(
+        "kdenlive", wait=True, timeout=5.0, window_pattern=None, desktop=None,
+        activate=True,
+    )
     out = capsys.readouterr().out
     assert out == "9\tkdenlive\tKdenlive\n"
 
@@ -122,7 +125,7 @@ def test_app_launch_with_wait_exits_when_no_window_appears():
 
 class TestMainErrorHandling:
     def test_main_reports_kdotool_error_friendly(self, capsys):
-        with patch("control.cli.build_parser") as mock_build:
+        with patch("control.cli.bootstrap"), patch("control.cli.build_parser") as mock_build:
             parser = mock_build.return_value
             fake_args = parser.parse_args.return_value
             fake_args.func.side_effect = windows.KdotoolError("no such window")
@@ -134,7 +137,7 @@ class TestMainErrorHandling:
         assert "kdotool" in err.lower()
 
     def test_main_reports_ydotool_error_friendly(self, capsys):
-        with patch("control.cli.build_parser") as mock_build:
+        with patch("control.cli.bootstrap"), patch("control.cli.build_parser") as mock_build:
             parser = mock_build.return_value
             fake_args = parser.parse_args.return_value
             fake_args.func.side_effect = cli.inp.YdotoolError("daemon not running")
@@ -146,7 +149,7 @@ class TestMainErrorHandling:
         assert "ydotoold" in err
 
     def test_main_reports_app_launch_error_friendly(self, capsys):
-        with patch("control.cli.build_parser") as mock_build:
+        with patch("control.cli.bootstrap"), patch("control.cli.build_parser") as mock_build:
             parser = mock_build.return_value
             fake_args = parser.parse_args.return_value
             fake_args.func.side_effect = apps.AppLaunchError("unknown app")
@@ -158,7 +161,7 @@ class TestMainErrorHandling:
         assert "control app list" in err
 
     def test_main_reraises_unexpected_errors(self, capsys):
-        with patch("control.cli.build_parser") as mock_build:
+        with patch("control.cli.bootstrap"), patch("control.cli.build_parser") as mock_build:
             parser = mock_build.return_value
             fake_args = parser.parse_args.return_value
             fake_args.func.side_effect = ValueError("something else broke")
