@@ -1,4 +1,4 @@
-"""Native desktop apps through AT-SPI, the Linux accessibility bus.
+"""Native desktop apps through the platform's accessibility API.
 
 Screen readers use it to read and operate Qt, GTK, Chromium and Electron apps;
 so can an agent: list an app's widgets with their role, name, state and text,
@@ -6,18 +6,23 @@ read a field's value, press a button or type into an editable -- by *element*,
 not by screen coordinates, and without needing the window to be focused or even
 visible (actions run inside the app).
 
-Dependencies: libatspi is only reachable through PyGObject (`gi`), a C
-extension that distributions build against their own Python. Rather than
-compiling it into the project venv, the tree walking happens in
-`_atspi_helper.py`, run by the system interpreter that already has it
-(CONTROL_ATSPI_PYTHON overrides which one). This module is the venv side:
-it starts the worker, speaks JSON with it and turns its errors into ones with
-a next step.
+Two backends, one interface:
 
-Apps only publish their tree while the bus is enabled (`org.a11y.Status
-IsEnabled`, see `set_enabled`). Qt and GTK apps notice the switch live;
-Chromium/Electron apps read it at startup, and additionally want
-`--force-renderer-accessibility`.
+* **Linux -- AT-SPI**, the freedesktop accessibility bus. libatspi is only
+  reachable through PyGObject (`gi`), a C extension that distributions build
+  against *their* Python, so rather than compiling it into the project venv the
+  tree walking happens in `_atspi_helper.py`, run by the system interpreter that
+  already has it (CONTROL_ATSPI_PYTHON overrides which one). This module is the
+  venv side: it starts the worker, speaks JSON with it and turns its errors into
+  ones with a next step;
+* **Windows -- UI Automation**, through `comtypes` (`_uia.py`). UIA is COM, so
+  there is nothing to compile and nothing to fork: the same JSON operations are
+  answered in-process, by the very interpreter running the command.
+
+Apps only publish their tree while the bus is enabled on Linux
+(`org.a11y.Status IsEnabled`, see `set_enabled`); Qt and GTK apps notice the
+switch live, Chromium/Electron apps read it at startup and additionally want
+`--force-renderer-accessibility`. Windows has no such switch: UIA is always on.
 """
 from __future__ import annotations
 
@@ -28,6 +33,13 @@ import shutil
 import subprocess
 from pathlib import Path
 
+from . import platforms
+
+if platforms.IS_WINDOWS:
+    from . import _uia
+else:
+    _uia = None
+
 HELPER = Path(__file__).with_name("_atspi_helper.py")
 DEFAULT_TIMEOUT = 30.0
 
@@ -36,7 +48,7 @@ INSTALL_HINT = (
     "sudo pacman -S python-gobject at-spi2-core; Debian/Ubuntu: sudo apt install "
     "python3-gi gir1.2-atspi-2.0 at-spi2-core; Fedora: sudo dnf install python3-gobject "
     "at-spi2-core; or point CONTROL_ATSPI_PYTHON at a Python that has them"
-)
+) if _uia is None else _uia.UiaError.hint
 
 
 class AtspiError(RuntimeError):
@@ -130,6 +142,8 @@ def normalize_role(role: str) -> str:
 
 # --- the accessibility bus switch ----------------------------------------------------
 
+# --- the accessibility bus switch ----------------------------------------------------
+
 def _bus_property(*args: str) -> str:
     try:
         result = subprocess.run(
@@ -147,12 +161,21 @@ def _bus_property(*args: str) -> str:
 
 
 def is_enabled() -> bool:
+    """Whether apps publish their widgets at all.
+
+    Always true on Windows: UI Automation is part of the OS and cannot be
+    switched off per session.
+    """
+    if _uia is not None:
+        return True
     out = _bus_property("org.freedesktop.DBus.Properties.Get", "org.a11y.Status", "IsEnabled")
     return "true" in out
 
 
 def set_enabled(enabled: bool) -> None:
     """Flip org.a11y.Status.IsEnabled for this login session (not persisted)."""
+    if _uia is not None:
+        return  # nothing to switch: UIA is always on
     _bus_property("org.freedesktop.DBus.Properties.Set", "org.a11y.Status", "IsEnabled",
                   f"<{'true' if enabled else 'false'}>")
 
@@ -160,10 +183,18 @@ def set_enabled(enabled: bool) -> None:
 # --- the worker ---------------------------------------------------------------------------
 
 def helper_python() -> str | None:
-    """The interpreter that runs the worker: CONTROL_ATSPI_PYTHON, else the system one."""
+    """The interpreter that answers `a11y` calls.
+
+    Linux: CONTROL_ATSPI_PYTHON, else the system python3 that has `gi`. Windows:
+    there is no separate worker, so this is simply the interpreter running us.
+    """
     explicit = os.environ.get("CONTROL_ATSPI_PYTHON")
     if explicit:
         return explicit
+    if _uia is not None:
+        import sys
+
+        return sys.executable
     for candidate in ("/usr/bin/python3", shutil.which("python3")):
         if candidate and os.access(candidate, os.X_OK):
             return candidate
@@ -171,7 +202,17 @@ def helper_python() -> str | None:
 
 
 def call(op: str, timeout: float = DEFAULT_TIMEOUT, **params) -> dict:
-    """Run one worker operation; returns its result dict or raises an AtspiError."""
+    """Run one accessibility operation; returns its result dict or raises.
+
+    Windows answers in-process through UI Automation; Linux runs the AT-SPI
+    worker and translates its JSON.
+    """
+    if _uia is not None:
+        try:
+            return _uia.call(op, timeout=timeout, **{k: v for k, v in params.items()
+                                                     if v is not None})
+        except _uia.UiaError as exc:
+            raise _KINDS.get(getattr(exc, "kind", ""), AtspiError)(str(exc), exc.hint) from exc
     python = helper_python()
     if python is None:
         raise AtspiUnavailable("no system python3 found to run the AT-SPI worker")
@@ -205,7 +246,8 @@ def require_enabled() -> None:
 
 def status() -> dict:
     """Everything needed to tell why a tree comes back empty."""
-    info: dict = {"helper_python": helper_python(), "bus_enabled": None, "apps": []}
+    info: dict = {"helper_python": helper_python(), "bus_enabled": None, "apps": [],
+                  "backend": "uia" if _uia is not None else "at-spi"}
     try:
         info["bus_enabled"] = is_enabled()
     except AtspiError as exc:

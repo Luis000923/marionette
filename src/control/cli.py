@@ -1,5 +1,11 @@
 """Unified CLI for desktop control: windows, input, screenshots, apps, browser, sessions.
 
+The commands are the same on both platforms; only the desktop they talk to (and
+a handful of hints) differs -- KWin/kdotool/ydotool/spectacle under Plasma,
+Win32 through `winapi.py` on Windows. `platforms.py` picks the backend and every
+other module asks it, so nothing in here branches on the OS except the text of an
+error hint.
+
 Multi-agent use rests on four things wired up here:
 
 * `--session NAME` / `CONTROL_SESSION_ID` selects an agent's workspace, which
@@ -31,10 +37,13 @@ from typing import Any, Callable
 
 from playwright.sync_api import Error as PlaywrightError
 
-from . import apps, atspi, env, input as inp, screenshot, session as session_mod, windows
+from . import apps, atspi, env, input as inp, platforms, screenshot, session as session_mod, windows
 from . import browser as browser_mod
+from . import sudo
 from .browser import Browser
 from .env import load_env
+
+IS_WINDOWS = platforms.IS_WINDOWS
 
 
 # --- output plumbing ---------------------------------------------------------
@@ -123,6 +132,13 @@ def _utf8_stdio() -> None:
     for stream in (sys.stdout, sys.stderr):
         if not _is_utf8(getattr(stream, "encoding", "utf-8")) and hasattr(stream, "reconfigure"):
             stream.reconfigure(encoding="utf-8", errors="replace")
+    if IS_WINDOWS:
+        # Reconfiguring the streams is not enough: the console code page decides
+        # how those UTF-8 bytes are *rendered*, and the Spanish default (cp1252)
+        # turns "ñ" into mojibake. 65001 is the code page that can show it.
+        from . import winapi
+
+        winapi.set_console_utf8()
 
 
 def _json_mode(args: argparse.Namespace) -> bool:
@@ -151,7 +167,9 @@ def _ok(action: str, **fields: Any) -> dict:
 
 
 def _win_line(w: windows.Window) -> str:
-    return f"{w.id}\t{w.classname}\t{w.title}"
+    # The executable only exists on Windows, where the window class says nothing
+    # about which app it is; on Linux the line is exactly what it always was.
+    return f"{w.id}\t{w.classname}\t{w.title}" + (f"\t({w.process})" if w.process else "")
 
 
 def _desktop_dict(d: windows.Desktop, current: int | None = None) -> dict:
@@ -209,9 +227,9 @@ def _focused_input(args: argparse.Namespace, action: str, send: Callable[[], Non
                    **fields: Any) -> Out:
     """Run `send` under the input lock, first focusing --window if one was given.
 
-    Focus is as global as uinput: if agent A activated its window and then
-    released the lock before typing, agent B could activate its own in between
-    and A's keystrokes would land in B's window. Holding one lock across
+    Focus is as global as the input device: if agent A activated its window and
+    then released the lock before typing, agent B could activate its own in
+    between and A's keystrokes would land in B's window. Holding one lock across
     "focus + input" makes the pair atomic.
     """
     with inp.input_lock():
@@ -219,10 +237,20 @@ def _focused_input(args: argparse.Namespace, action: str, send: Callable[[], Non
         if getattr(args, "window", None):
             win = _find_window(args.window, args)
             if not win.focus():
+                if not windows.anything_focused():
+                    raise CliError(
+                        f"window {win.id} ({win.title!r}) could not be focused",
+                        hint=("nothing is focused anywhere in this session, and Windows "
+                              "will not hand the foreground to any process until it is: "
+                              "click a window once, then retry"),
+                        kind="focus_error",
+                    )
                 raise CliError(
                     f"window {win.id} ({win.title!r}) did not take focus",
-                    hint="KWin focus-stealing prevention may be blocking it; "
-                         "try 'control win activate' first",
+                    hint=("the desktop refused the focus change; try 'control win activate' "
+                          "first" if IS_WINDOWS else
+                          "KWin focus-stealing prevention may be blocking it; "
+                          "try 'control win activate' first"),
                     kind="focus_error",
                 )
         send()
@@ -379,8 +407,10 @@ def _paste_keys(args: argparse.Namespace) -> tuple[str, ...]:
     if getattr(args, "paste_keys", None):
         return tuple(k.strip().lower() for k in args.paste_keys.split("+"))
     try:
-        return inp.paste_keys_for(windows.active_window().classname)
-    except Exception:  # noqa: BLE001 - no KWin answer: the common case is not a terminal
+        # Title, class and executable together: a Windows terminal is
+        # CASCADIA_HOSTING_WINDOW_CLASS, a KDE one is konsole.
+        return inp.paste_keys_for(windows.active_window().match_text())
+    except Exception:  # noqa: BLE001 - no answer from the desktop: usually not a terminal
         return inp.DEFAULT_PASTE_KEYS
 
 
@@ -511,6 +541,18 @@ def _a11y_request(args: argparse.Namespace) -> dict:
     return req
 
 
+def _format_value(value: Any) -> str:
+    """An element's value, whatever the accessibility API typed it as.
+
+    AT-SPI always reports a float, but UIA's ValuePattern is a variant: a slider
+    gives 0.5, a text field gives "3 of 10". Numbers are printed in the shortest
+    exact form; anything else is shown as it is.
+    """
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return f"{value:g}"
+    return str(value)
+
+
 def _node_line(n: dict, indent: bool = True) -> str:
     parts = [("  " * n["depth"] if indent else "") + n["role"]]
     if n["name"]:
@@ -522,7 +564,7 @@ def _node_line(n: dict, indent: bool = True) -> str:
     if n.get("text"):
         parts.append("text=" + json.dumps(n["text"], ensure_ascii=False))
     if n.get("value"):
-        parts.append(f"value={n['value']['current']:g}")
+        parts.append(f"value={_format_value(n['value']['current'])}")
     return " ".join(parts) + f"\t{n['path'] or '/'}"
 
 
@@ -534,7 +576,8 @@ def _a11y(op: str, args: argparse.Namespace, **extra: Any) -> dict:
 @command
 def _cmd_a11y_status(args: argparse.Namespace) -> Out:
     info = atspi.status()
-    lines = [f"bus enabled: {info['bus_enabled']}", f"worker python: {info['helper_python']}"]
+    lines = [f"backend: {info['backend']}", f"bus enabled: {info['bus_enabled']}",
+             f"worker python: {info['helper_python']}"]
     if not info.get("available"):
         lines.append(f"worker unavailable: {info.get('error')} ({info.get('hint')})")
     lines += [f"  {a['pid']}\t{a['toolkit']}\t{a['name']}\t{a['children']} top-level"
@@ -546,9 +589,14 @@ def _cmd_a11y_status(args: argparse.Namespace) -> Out:
 def _cmd_a11y_enable(args: argparse.Namespace) -> Out:
     atspi.set_enabled(not args.off)
     enabled = atspi.is_enabled()
-    text = ("accessibility bus enabled: Qt/GTK apps publish their widgets now; restart "
-            "Chromium/Electron apps with --force-renderer-accessibility" if enabled
-            else "accessibility bus disabled")
+    if IS_WINDOWS:
+        text = ("UI Automation is always on: every app that publishes a tree is readable "
+                "right now, and there is no switch to turn"
+                if enabled else "UI Automation is always on: nothing to enable")
+    else:
+        text = ("accessibility bus enabled: Qt/GTK apps publish their widgets now; restart "
+                "Chromium/Electron apps with --force-renderer-accessibility" if enabled
+                else "accessibility bus disabled")
     return Out(_ok("a11y_enable", enabled=enabled), text)
 
 
@@ -582,7 +630,11 @@ def _cmd_a11y_get(args: argparse.Namespace) -> Out:
     el = data["element"]
     lines = [_node_line(el, indent=False)]
     if el.get("value"):
-        lines.append(f"value: {el['value']['current']:g} (range {el['value']['min']:g}..{el['value']['max']:g})")
+        shown = f"value: {_format_value(el['value']['current'])}"
+        if "min" in el["value"] and "max" in el["value"]:
+            shown += (f" (range {_format_value(el['value']['min'])}.."
+                      f"{_format_value(el['value']['max'])})")
+        lines.append(shown)
     if el.get("description"):
         lines.append(f"description: {el['description']}")
     lines.append(f"states: {', '.join(el.get('states_all', []))}")
@@ -596,7 +648,7 @@ def _cmd_a11y_read(args: argparse.Namespace) -> Out:
     if el.get("text") is not None:
         content = el["text"]
     elif el.get("value"):
-        content = f"{el['value']['current']:g}"
+        content = _format_value(el["value"]["current"])
     else:
         content = el["name"]
     return Out({"path": el["path"], "role": el["role"], "name": el["name"], "content": content},
@@ -641,7 +693,9 @@ def _cmd_a11y_wait(args: argparse.Namespace) -> Out:
 def _cmd_sandbox(args: argparse.Namespace) -> Out:
     command_line = args.cmd[1:] if args.cmd[:1] == ["--"] else args.cmd
     if not command_line:
-        raise CliError("no command to run", hint="e.g. control sandbox -- ./agent_task.sh",
+        raise CliError("no command to run",
+                       hint=("e.g. control sandbox -- python run_checks.py" if IS_WINDOWS
+                             else "e.g. control sandbox -- ./agent_task.sh"),
                        kind="usage_error")
     if args.timeout is not None and args.timeout <= 0:
         raise CliError("--timeout must be positive", kind="usage_error")
@@ -713,7 +767,9 @@ def _cmd_session_init(args: argparse.Namespace) -> Out:
         f"  state:   {session.dir}",
         f"  profile: {session.profile_dir}",
         f"  export CONTROL_SESSION_ID={session.name}",
-    ])
+    ] + ([] if session.isolated else [
+        f"  WARNING: not isolated -- {windows.virtual_desktops_hint() or 'one desktop only'}",
+    ]))
     return Out(session.to_dict(), text)
 
 
@@ -726,10 +782,15 @@ def _cmd_session_status(args: argparse.Namespace) -> Out:
     for entry in state["sessions"]:
         marker = "*" if entry["active"] else " "
         missing = "" if entry["desktop_exists"] else " (desktop gone)"
-        lines.append(f"{marker} {entry['name']}\tdesktop {entry['desktop']}{missing}\t"
+        shared = "" if entry.get("isolated", True) else " (not isolated)"
+        lines.append(f"{marker} {entry['name']}\tdesktop {entry['desktop']}{missing}{shared}\t"
                      f"{len(entry['windows'])} window(s)")
         lines += [f"    {w['id']}\t{w['class']}\t{w['title']}" for w in entry["windows"]]
-    return Out(state, "\n".join(lines))
+    hint = ""
+    if not windows.virtual_desktops_available():
+        hint = ("\nthis Windows has no virtual desktops: agents share one desktop "
+                f"({windows.virtual_desktops_hint()})")
+    return Out(state, "\n".join(lines) + hint)
 
 
 @command
@@ -1046,7 +1107,9 @@ class _Parser(argparse.ArgumentParser):
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = _Parser(prog="control", description="Full desktop control for KDE/Wayland")
+    p = _Parser(prog="control", description=(
+        "Full desktop control for Windows" if IS_WINDOWS else
+        "Full desktop control for KDE Plasma on Wayland"))
     p.add_argument(
         "--session", default=None, metavar="NAME",
         help="act as this agent session (same as CONTROL_SESSION_ID): scopes window "
@@ -1178,10 +1241,13 @@ def build_parser() -> argparse.ArgumentParser:
     typ.add_argument("--delay", type=int, default=0, metavar="MS", help="delay between keys")
     typ.add_argument(
         "--method", choices=inp.TEXT_METHODS, default="auto",
-        help="auto (default): type plain ASCII letters/digits, paste through the clipboard "
-             "anything with accents, ñ, symbols or other Unicode (ydotool drops or "
-             "remaps those); paste/type: force one. Use type for secrets: a clipboard "
-             "manager may keep pasted text in its history",
+        help=("auto (default): type everything as Unicode, exactly, on any layout"
+              if IS_WINDOWS else
+              "auto (default): type plain ASCII letters/digits, paste through the clipboard "
+              "anything with accents, ñ, symbols or other Unicode (ydotool drops or "
+              "remaps those)")
+             + "; paste/type: force one. Use type for secrets: a clipboard manager (or "
+               "Win+V history) may keep pasted text",
     )
     typ.add_argument("--paste-keys", default=None, metavar="KEYS",
                      help="paste shortcut, e.g. ctrl+shift+v (default: ctrl+shift+v in "
@@ -1209,8 +1275,8 @@ def build_parser() -> argparse.ArgumentParser:
     add_window_option(key)
 
     drag = leaf(sub, "drag", _cmd_drag,
-                help="press, glide and release the mouse (e.g. drag a file from Dolphin "
-                     "onto a web page); the button is always released, even on errors")
+                help="press, glide and release the mouse (e.g. drag a file from a file "
+                     "manager onto a web page); the button is always released, even on errors")
     drag.add_argument("--from", dest="start", type=_point, required=True, metavar="X,Y")
     drag.add_argument("--to", dest="end", type=_point, required=True, metavar="X,Y")
     drag.add_argument("--button", default="left", choices=["left", "right", "middle"])
@@ -1222,7 +1288,9 @@ def build_parser() -> argparse.ArgumentParser:
                            f"(default: {inp.DEFAULT_DRAG_HOLD_MS})")
     add_window_option(drag)
 
-    clip = sub.add_parser("clip", help="Wayland clipboard (wl-copy/wl-paste)")
+    clip = sub.add_parser("clip", help=("clipboard (Win32 CF_UNICODETEXT/CF_HDROP)"
+                                        if IS_WINDOWS else
+                                        "Wayland clipboard (wl-copy/wl-paste)"))
     clip_sub = clip.add_subparsers(dest="clip_command", required=True)
     c = leaf(clip_sub, "set", _cmd_clip_set,
              help="copy text, or files as text/uri-list (paste them into a page instead "
@@ -1239,7 +1307,7 @@ def build_parser() -> argparse.ArgumentParser:
     c = leaf(clip_sub, "get", _cmd_clip_get, help="print the clipboard contents")
     c.add_argument("--mime", default=None, help="ask for this MIME type (e.g. text/uri-list)")
 
-    desktop = sub.add_parser("desktop", help="KDE virtual desktops (create/remove/switch)")
+    desktop = sub.add_parser("desktop", help="virtual desktops (create/remove/switch)")
     desktop_sub = desktop.add_subparsers(dest="desktop_command", required=True)
 
     leaf(desktop_sub, "list", _cmd_desktop_list)
@@ -1294,8 +1362,10 @@ def build_parser() -> argparse.ArgumentParser:
     sc.add_argument("--remove-desktop", action="store_true",
                     help="also delete the session's virtual desktop")
 
-    a11y = sub.add_parser("a11y", help="native apps (Qt/GTK/Electron) through the AT-SPI "
-                                       "accessibility tree: read and operate widgets by name")
+    a11y = sub.add_parser("a11y", help=("native apps through the UI Automation tree: read "
+                                        "and operate widgets by name" if IS_WINDOWS else
+                                        "native apps (Qt/GTK/Electron) through the AT-SPI "
+                                        "accessibility tree: read and operate widgets by name"))
     a11y_sub = a11y.add_subparsers(dest="a11y_command", required=True)
 
     def a11y_target(parser: argparse.ArgumentParser, element: bool = True) -> None:
@@ -1308,7 +1378,9 @@ def build_parser() -> argparse.ArgumentParser:
         if not element:
             return
         parser.add_argument("--path", default=None, help="element path from 'a11y tree', e.g. /0/3/1")
-        parser.add_argument("--role", default=None, help="role contains, e.g. 'push button', entry")
+        parser.add_argument("--role", default=None,
+                            help="role contains, e.g. 'push button', entry (mapped to the "
+                                 "platform's own role names)")
         parser.add_argument("--name", default=None, help="accessible name contains (case-insensitive)")
         parser.add_argument("--text", default=None, help="text content contains")
         parser.add_argument("--state", action="append", default=[], metavar="STATE",
@@ -1321,7 +1393,9 @@ def build_parser() -> argparse.ArgumentParser:
     leaf(a11y_sub, "status", _cmd_a11y_status,
          help="is the bus on, can the worker run, which apps publish a tree")
     x = leaf(a11y_sub, "enable", _cmd_a11y_enable,
-             help="turn the accessibility bus on for this login session (--off to turn it off)")
+             help=("check that the accessibility tree is readable (UI Automation needs no "
+                   "switch on Windows)" if IS_WINDOWS else
+                   "turn the accessibility bus on for this login session (--off to turn it off)"))
     x.add_argument("--off", action="store_true")
     x = leaf(a11y_sub, "apps", _cmd_a11y_apps, help="applications on the accessibility bus")
     x.add_argument("--all", action="store_true", help="include apps that publish no widgets")
@@ -1507,26 +1581,6 @@ def _snake_case(name: str) -> str:
     return "".join(out)
 
 
-_ERROR_HINTS: dict[type, str] = {
-    windows.KdotoolError: "check that kdotool is installed and KWin scripting is enabled",
-    windows.DesktopError: "list desktops with 'control desktop list' (KWin's D-Bus API must be reachable)",
-    inp.YdotoolError: "check ydotoold is running: systemctl status ydotoold",
-    inp.ClipboardError: "install wl-clipboard (sudo pacman -S wl-clipboard) and run inside "
-                        "the Wayland session (WAYLAND_DISPLAY must be set)",
-    inp.LockTimeout: (
-        "another control process held the input lock too long; check with "
-        "'control session status', or raise CONTROL_INPUT_LOCK_TIMEOUT"
-    ),
-    session_mod.SessionError: "list known sessions with: control session list",
-    apps.AppLaunchError: "check the app id with: control app list",
-    screenshot.ScreenshotError: "check that spectacle is installed and works: spectacle -b -n -f",
-    env.EnvPermissionError: "restrict the file to its owner: chmod 600 <file>",
-    browser_mod.BrowserError: "browser automation failed",
-    atspi.AtspiError: "check the accessibility setup with: control a11y status",
-    PlaywrightError: "browser action failed; check the selector/URL and that the page finished loading",
-}
-
-
 def _hint_for(exc: BaseException) -> str:
     if getattr(exc, "hint", ""):
         return exc.hint  # errors that know their own next step (browser.py)
@@ -1534,6 +1588,64 @@ def _hint_for(exc: BaseException) -> str:
         if klass in _ERROR_HINTS:
             return _ERROR_HINTS[klass]
     return ""
+
+
+def _error_hints() -> dict[type, str]:
+    """What to tell the user after each kind of failure, on this platform.
+
+    The advice is where the difference is: on Plasma a dead input device means
+    `ydotoold` is not running and a missing window means KWin scripting is off,
+    while on Windows the same symptoms mean an elevated app, a closed window or
+    a build without virtual desktops.
+    """
+    hints: dict[type, str] = {}
+    if IS_WINDOWS:
+        hints.update({
+            windows.WindowError: "list windows with: control win list --json",
+            windows.DesktopError: (
+                "list desktops with: control desktop list"
+                + (f" ({windows.virtual_desktops_hint()})"
+                   if windows.virtual_desktops_hint() else "")),
+            inp.InputError: ("Windows refused the input: the focused window may belong "
+                             "to an app running as administrator, which no normal "
+                             "process may type into"),
+            inp.ClipboardError: "another application is holding the clipboard open",
+            screenshot.ScreenshotError: "check the screen is on: control shot full",
+            sudo.SudoError: "nothing here needs elevation on Windows; re-run from an "
+                            "elevated PowerShell only if a setup step asks for it",
+        })
+    else:
+        hints.update({
+            windows.KdotoolError: "check that kdotool is installed and KWin scripting is enabled",
+            windows.DesktopError: "list desktops with 'control desktop list' (KWin's D-Bus API must be reachable)",
+            inp.YdotoolError: "check ydotoold is running: systemctl status ydotoold",
+            inp.ClipboardError: ("install wl-clipboard (sudo pacman -S wl-clipboard) and run "
+                                 "inside the Wayland session (WAYLAND_DISPLAY must be set)"),
+            screenshot.ScreenshotError: "check that spectacle is installed and works: spectacle -b -n -f",
+        })
+    hints.update({
+        inp.LockTimeout: (
+            "another control process held the input lock too long; check with "
+            "'control session status', or raise CONTROL_INPUT_LOCK_TIMEOUT"
+        ),
+        session_mod.SessionError: "list known sessions with: control session list",
+        apps.AppLaunchError: "check the app id with: control app list",
+        env.EnvPermissionError: ("move the .env into your user profile, which is private "
+                                 "by default" if IS_WINDOWS else
+                                 "restrict the file to its owner: chmod 600 <file>"),
+        browser_mod.BrowserError: "browser automation failed",
+        atspi.AtspiError: "check the accessibility setup with: control a11y status",
+        PlaywrightError: ("browser action failed; check the selector/URL and that the page "
+                          "finished loading"),
+    })
+    if windows.Win32Error is not None:
+        hints[windows.Win32Error] = (
+            "a Win32 call failed; run 'control --json win list' to see whether the window "
+            "still exists, and remember an elevated app cannot be driven by a normal one")
+    return hints
+
+
+_ERROR_HINTS: dict[type, str] = _error_hints()
 
 
 def _report(args: argparse.Namespace | None, kind: str, message: str, hint: str) -> None:

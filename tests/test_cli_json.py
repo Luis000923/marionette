@@ -3,6 +3,7 @@ named --desktop targets, focus-then-input under one lock, per-session traces."""
 from __future__ import annotations
 
 import json
+import os
 import sys
 from unittest.mock import patch
 
@@ -126,13 +127,16 @@ class TestJsonEverywhere:
 
 class TestStructuredErrors:
     def test_known_error_becomes_json(self, capsys, monkeypatch):
-        with patch("control.cli.windows.list_windows",
-                   side_effect=windows.KdotoolError("kwin script failed")):
+        # Whichever backend is in use, its own error type maps to a stable JSON
+        # `type` and to a hint the user can act on.
+        failure = (windows.Win32Error("the window is gone", api="IsWindow")
+                   if os.name == "nt" else windows.KdotoolError("kwin script failed"))
+        with patch("control.cli.windows.list_windows", side_effect=failure):
             code = _main(["win", "list", "--json"], monkeypatch)
         assert code == 1
         err = json.loads(capsys.readouterr().out)
-        assert err == {"error": "kwin script failed", "type": "kdotool_error",
-                       "hint": cli._ERROR_HINTS[windows.KdotoolError]}
+        assert err == {"error": str(failure), "type": cli._snake_case(type(failure).__name__),
+                       "hint": cli._ERROR_HINTS[type(failure)]}
 
     def test_cli_error_carries_its_hint(self, capsys, monkeypatch):
         with patch("control.cli.windows.find_one", return_value=None):
@@ -234,10 +238,27 @@ class TestFocusedInput:
         win = windows.Window(id="w1", title="Editor")
         with patch("control.cli.windows.find_one", return_value=win), \
              patch.object(windows.Window, "focus", return_value=False), \
+             patch("control.cli.windows.anything_focused", return_value=True), \
              patch("control.cli.inp.key_combo") as mock_key:
             with pytest.raises(SystemExit, match="did not take focus"):
                 _run(["key", "enter", "--window", "Editor"])
         mock_key.assert_not_called()
+
+    def test_a_session_with_nothing_focused_is_named_as_the_cause(self, capsys, monkeypatch):
+        # Windows will not hand the foreground to anyone while nothing holds it,
+        # which is a different problem from focus-stealing prevention and needs a
+        # different instruction.
+        win = windows.Window(id="w1", title="Editor")
+        with patch("control.cli.windows.find_one", return_value=win), \
+             patch.object(windows.Window, "focus", return_value=False), \
+             patch("control.cli.windows.anything_focused", return_value=False), \
+             patch("control.cli.inp.key_combo") as mock_key:
+            code = _main(["key", "enter", "--window", "Editor", "--json"], monkeypatch)
+        assert code == 1
+        mock_key.assert_not_called()
+        err = json.loads(capsys.readouterr().out)
+        assert err["type"] == "focus_error"
+        assert "click a window once" in err["hint"]
 
     def test_window_lookup_honours_the_session_desktop(self):
         with patch("control.session.windows.ensure_desktop", return_value=_desktop(1, "control:a")):

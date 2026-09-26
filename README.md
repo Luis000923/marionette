@@ -1,16 +1,84 @@
 # control (marionette)
 
-Full desktop control for KDE Plasma on Wayland: windows, input, screenshots, apps, and
-browser automation. Stdlib + subprocess wrappers around `kdotool`, `ydotool`, and
-`spectacle`; Playwright is used only for browser DOM control.
+Full desktop control on **Windows** and on **KDE Plasma/Wayland**: windows,
+input, screenshots, apps, and browser automation. The commands, the JSON
+contract and the multi-agent model are the same on both; what differs is how the
+desktop is reached:
+
+| | Windows | KDE Plasma / Wayland |
+|---|---|---|
+| windows | Win32 through `ctypes` (`winapi.py`) | `kdotool` (KWin scripting) |
+| input | `SendInput`, incl. `KEYEVENTF_UNICODE` | `ydotool` (uinput) |
+| clipboard | `CF_UNICODETEXT` / `CF_HDROP` | `wl-copy` / `wl-paste` |
+| screenshots | GDI (`PrintWindow` / `BitBlt`) | `spectacle` |
+| native apps | UI Automation (via `comtypes`) | AT-SPI (via PyGObject) |
+| virtual desktops | `IVirtualDesktopManager` | KWin's D-Bus API |
+| state | `%LOCALAPPDATA%\control` | `~/.local/share/control` |
+
+Only `control a11y` needs a Python dependency, and only on Windows
+(`comtypes`); everything else is stdlib. Playwright drives the browser on both
+platforms, so `control browser` is identical.
 
 ## Setup
+
+### Windows
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\install.ps1
+ctrl win list --json
+```
+
+The script syncs the project, downloads Playwright's Chromium, writes a private
+`.env` (ACLs, not mode bits) and puts a `ctrl` shim on your PATH. **Nothing
+needs an elevated shell**: input, clipboard, screenshots and accessibility all
+come from the session itself, so there is no daemon to install and no device
+permissions to grant.
+
+It is `ctrl`, not `control`, on Windows: `C:\Windows\System32\control.exe` is the
+Control Panel and System32 comes first in PATH, so a `control` shim there is
+unreachable however the PATH is ordered. The installer also writes `control.cmd`
+for parity with Linux, and `.venv\Scripts\control.exe` works as `control` from
+inside the repo. Everything else — arguments, subcommands, exit codes, JSON
+output — is identical on both platforms.
+
+### KDE Plasma
 
 ```
 uv sync
 uv run playwright install chromium
 sudo ./scripts/install.sh   # installs ydotool/kdotool/wl-clipboard/AT-SPI, enables ydotoold, group perms
 ```
+
+## Windows notes
+
+Things that are genuinely different, and why:
+
+- **Typing is exact.** `SendInput` with `KEYEVENTF_UNICODE` sends the characters
+  themselves, so accents, ñ, `¿`, `€`, CJK and RTL text arrive unchanged on any
+  keyboard layout, and `control type` never touches the clipboard. The one
+  exception is characters outside the Basic Multilingual Plane (emoji): a single
+  key event cannot carry a surrogate pair, so those are pasted, and
+  `--method type` warns if you force it. Measured: "Hola señor ¿Qué tal? a:b/c
+  ñáéíóú€ [x] &q ~z^ 50%" comes out character for character.
+- **Window ids are the handles**, and `--window PATTERN` accepts one (a bare
+  number) too, because `win list --json` prints them and an agent will feed one
+  straight back. Patterns match the title, the window class *and* the
+  executable: on Windows the class says nothing about the app
+  (`Chrome_WidgetWin_1`), so `win list brave` matches `brave.exe`.
+- **UAC is a wall for input.** Windows forbids sending input to a window whose
+  process runs with higher integrity, so a normal `control` cannot type into an
+  elevated app. Run `control` from an elevated terminal if the target is.
+- **Virtual desktops need Windows 10 1607+.** Where `IVirtualDesktopManager` is
+  missing (older builds, Server editions, stripped images), `control` says so and
+  works against the single desktop instead: `session init` still gives an agent
+  its own browser profile, log and `.env`, but reports `isolated: false`, and its
+  windows are shared with everyone else's.
+- **`control a11y enable` has nothing to enable.** UI Automation is always on.
+  Roles are UIA control types ("Button", "Edit"), and the AT-SPI spellings you
+  may know (`push button`, `check box`, `entry`) are mapped onto them, so the
+  same `--role` filters work on both platforms.
+- **A session name may not contain** `\ : * ? " < > |` -- those are illegal in
+  Windows names, and the session name becomes a directory.
 
 ## Token efficiency for agents driving this tool
 
@@ -27,7 +95,9 @@ keep that cost down without losing verification quality:
    before the real output. Call the synced venv's binary directly instead:
 
    ```
-   /home/luis/Documentos/control/.venv/bin/control win list --json
+   ctrl win list --json                                         # Windows, the PATH shim
+   .venv\Scripts\control.exe win list --json                    # Windows, full path
+   /home/luis/Documentos/control/.venv/bin/control win list      # Linux
    ```
 
    Same output, none of the resolver chatter. Re-run `uv sync` (or fall back to
@@ -55,22 +125,31 @@ keep that cost down without losing verification quality:
 
 5. **Batch independent steps into one shell call.** Launch + wait + verify as
    one `&&`-chained command instead of three separate tool round-trips, when
-   the steps don't depend on inspecting intermediate output.
+   the steps don't depend on inspecting intermediate output. In PowerShell use
+   `;` or `&&` (7+) — `&&` works there too since PowerShell 7.
 
 6. **Cache what you already queried.** Re-use a window's id/geometry from the
-   last `win list --json` instead of re-querying state that hasn't changed.
+   last `win list --json` instead of re-querying state that hasn't changed. On
+   Windows you can hand that id straight back: `--window 396334` works, and it
+   skips the pattern search.
 
-### Sudo password (optional)
+### Elevation (Linux only)
 
-A few setup/repair tasks genuinely need root (restarting `ydotoold`, fixing `uinput`
-group membership). Rather than prompting interactively, `control.sudo.run_as_root`
-reads `CONTROL_SUDO_PASSWORD` from `.env` and pipes it to `sudo -S` over stdin.
+A few setup/repair tasks genuinely need root (restarting `ydotoold`, fixing
+`uinput` group membership). Rather than prompting interactively,
+`control.sudo.run_as_root` reads `CONTROL_SUDO_PASSWORD` from `.env` and pipes
+it to `sudo -S` over stdin.
 
 ```
 cp .env.example .env
 chmod 600 .env
 # edit .env and set CONTROL_SUDO_PASSWORD="your-password"
 ```
+
+On Windows **nothing needs elevation**: input comes from the Win32 input queue,
+the clipboard from user32, and there is no daemon or device node to manage.
+`run_as_root` there is the UAC prompt (`ShellExecute` with the `runas` verb),
+and the two Linux setup helpers say so instead of failing obscurely.
 
 How the password is protected:
 
@@ -82,28 +161,39 @@ How the password is protected:
   environment.
 - **It's never an argument and never logged.** Arguments are visible to every user
   through `ps`.
-- **The file must be private.** If an `.env` is readable by group or others (for
-  example mode `644`), `control` prints a warning on stderr, and **refuses to read
-  the password from it**. It also refuses a file owned by another user. Set
+- **The file must be private.** On Linux that means mode `600` and your own uid:
+  if an `.env` is readable by group or others (for example mode `644`), `control`
+  prints a warning on stderr, and **refuses to read the password from it**. It
+  also refuses a file owned by another user. On Windows every file reports mode
+  `0666` whatever its ACLs are, so privacy is decided by *where* the file is:
+  anything inside your user profile is private by inheritance, and anything
+  outside it (`C:\Users\Public`, a synced folder) is flagged. Set
   `CONTROL_ENV_STRICT=1` to reject insecure `.env` files entirely, even ones
   without secrets.
 
 `.env` is gitignored. The password is only used by the narrow setup helpers
-(`control.sudo.restart_ydotoold`, `control.sudo.ensure_uinput_group`). Everyday
-commands never touch sudo.
+(`control.sudo.restart_ydotoold`, `control.sudo.ensure_uinput_group`, which exist
+on Linux only). Everyday commands never touch elevation.
 
 ## Launching apps
 
-`control app launch ID` takes the app's `.desktop` id, which is often not the
-command name: KCalc is `org.kde.kcalc`, Dolphin `org.kde.dolphin`. When the id
-is wrong, the error's hint names the likely one — matching the id's last
-segment, the display name, and typos:
+`control app launch ID` takes the app's id, which is often not the command name:
+KCalc is `org.kde.kcalc` and Dolphin `org.kde.dolphin` on Linux; on Windows it is
+the Start Menu shortcut's path under `Programs` with `\` turned into `.`
+(`google.chrome`, `microsoft.windowsnotepad_...`). Anything on `PATH` works
+too, so `control app launch notepad` does what you expect. When the id is
+wrong, the error's hint names the likely ones — matching the id's last segment,
+the display name, and typos:
 
 ```
 $ control app launch kcalc
 [ERROR] app_launch_error: gtk-launch: no such application kcalc (did you mean: org.kde.kcalc? ...)
 $ control app list calc          # search ids and names
 ```
+
+Apps are started detached: on Windows with `DETACHED_PROCESS` in its own
+process group (closing the terminal does not close the app), on Linux in its own
+session.
 
 ## Waiting for slow-starting apps
 
@@ -122,7 +212,7 @@ the raw `subprocess.CompletedProcess`.
 
 Two guarantees make `--wait` safe to chain with input commands:
 
-- **Only a new window counts.** Before running `gtk-launch`, `control` records the
+- **Only a new window counts.** Before starting the app, `control` records the
   ids of the windows that already match. While waiting, it ignores those ids. So
   if Kdenlive is already open, `--wait` waits for the *new* window instead of
   returning the old one immediately. In Python, take the baseline yourself with
@@ -381,7 +471,8 @@ Wayland clipboard when `wl-copy` is installed, and only typed otherwise:
 `ydotool type` sends US-layout keycodes, so on other layouts `:` and `/` come out
 wrong (a Spanish layout turns `https://` into `httpsÑ--` and the browser searches
 for that). Pasting replaces the clipboard's contents; the JSON result says
-`entered_by: "paste" | "type"`.
+`entered_by: "paste" | "type"`. On Windows the URL is always *typed*: key events
+carry the characters themselves, so the clipboard is left alone.
 
 If the browser does have a debug port, `focus-and-goto` can also wait for the
 page — it watches the navigation over CDP until the new document is ready:
@@ -402,19 +493,32 @@ and corrected until it is exact — typically 3–4 moves, ~40 ms. A target that
 can't be reached (off-screen coordinates) is an error, not a silent miss.
 Coordinates are compositor (logical) pixels, the same space as window geometry.
 
+On Windows `SetCursorPos` is absolute and exact, so one move is enough, and
+coordinates are physical pixels: the process asks for per-monitor DPI awareness
+at start-up, so window geometry, the cursor and any screenshot all agree even on
+a scaled multi-monitor setup.
+
 ### Typing text with accents, ñ and symbols
 
-`ydotool type` sends US-layout keycodes for ASCII and silently **drops**
-everything else, so on a Spanish layout `presentación aquí a:b/c` arrives as
-`presentacin aqu aÑb-c`. `control type` therefore picks the method per text:
+On Wayland, `ydotool type` sends US-layout keycodes for ASCII and silently
+**drops** everything else, so on a Spanish layout `presentación aquí a:b/c`
+arrives as `presentacin aqu aÑb-c`. `control type` therefore picks the method per
+text:
 
-| Text | `--method auto` (default) does |
+| Text | `--method auto` (default) does on Wayland |
 |---|---|
 | only ASCII letters, digits, spaces, newlines, `,` `.` | types it (fast, clipboard untouched) |
 | anything else: `á é í ó ú ñ ü ¿ ¡ € : / @ ( ...`, emoji, CJK | pastes it through the clipboard, byte-exact UTF-8 |
 
+On Windows the second row does not exist: `SendInput` with `KEYEVENTF_UNICODE`
+types the characters themselves, so **everything in the Basic Multilingual Plane
+is typed and the clipboard stays untouched** — accents, `ñ`, `¿`, `€`, CJK, RTL,
+even `a:b/c` on a Spanish layout. Only characters outside the BMP (emoji) have to
+be pasted, because one key event cannot carry a surrogate pair; `choose_text_method`
+does that automatically and `--method type` warns if you force it.
+
 ```
-control type "¿Qué tal, señor Núñez?" --window Brave      # pasted
+control type "¿Qué tal, señor Núñez?" --window Brave      # pasted on Wayland, typed on Windows
 control type "cd ~/Música" --window kitty                 # pasted with Ctrl+Shift+V
 echo "acción: ñandú" | control type - --window kate       # stdin is read as UTF-8
 control type "p4ssw0rd" --method type --window Brave      # force typing (see below)
@@ -423,36 +527,40 @@ control type "p4ssw0rd" --method type --window Brave      # force typing (see be
 - The previous clipboard contents (text or a copied file list) are put back
   after the paste, and an empty clipboard is emptied again; the JSON result says
   `clipboard_restored`. A copied image can't be put back (`false`).
-- Terminals (kitty, konsole, alacritty, foot, wezterm, ...) get Ctrl+Shift+V;
-  everything else Ctrl+V. Override with `--paste-keys shift+insert`.
+- Terminals (kitty, konsole, alacritty, foot, wezterm, Windows Terminal, pwsh,
+  cmd, ...) get Ctrl+Shift+V; everything else Ctrl+V. Override with
+  `--paste-keys shift+insert`.
 - Without `wl-clipboard`, text with non-ASCII characters is an error
   (`clipboard_error`) instead of silently losing letters; ASCII symbols are then
   typed with a `warning`, since they are only right on a US layout.
-- `--method type` forces typing and warns about the characters that will be
-  dropped. Use it for secrets: a clipboard manager (Klipper) may keep pasted text
-  in its history.
+- `--method type` forces typing and warns about the characters that will not
+  survive (non-ASCII on Wayland, emoji on Windows). Use it for secrets: a
+  clipboard manager (Klipper) or the Windows clipboard history (Win+V) may keep
+  pasted text around.
 - Text stays UTF-8 end to end whatever the locale: stdin is decoded from its raw
   bytes (invalid UTF-8 is an `encoding_error`, a BOM is dropped), arguments
   mangled by a Latin-1/C locale (`presentaciÃ³n`) are repaired before parsing,
-  stdout is switched to UTF-8, and wl-copy/wl-paste always exchange UTF-8 bytes.
+  stdout is switched to UTF-8 (and the console code page to 65001 on Windows, so
+  `ñ` is not mojibake), and wl-copy/wl-paste always exchange UTF-8 bytes.
   `control clip set -` reads stdin the same way.
 
 ### `control drag`
 
 ```
-control drag --from 300,420 --to 1100,380                      # e.g. Dolphin -> a web page
-control drag --from 300,420 --to 1100,380 --steps 30 --hold 250 --window Dolphin
+control drag --from 300,420 --to 1100,380                      # e.g. a file manager -> a web page
+control drag --from 300,420 --to 1100,380 --steps 30 --hold 250 --window Explorer
 ```
 
 Presses at `--from`, pauses `--hold` ms (default 150), glides to `--to` in
 `--steps` moves (default 20) so the source sees a real drag start and the drop
 target gets `dragenter`/`dragover`, pauses again, and releases. While the button
-is down only relative moves are sent (an absolute move would drag the item to
-the screen corner first), the whole gesture holds the input lock, and the
-button is released even if a move fails midway. For web drop zones reachable
+is down only relative moves are sent on ydotool (an absolute move would drag the
+item to the screen corner first); Windows only ever moves absolutely and exactly,
+so the same call is right for both. The whole gesture holds the input lock, and
+the button is released even if a move fails midway. For web drop zones reachable
 over CDP, `browser drop` is more reliable than a physical drag.
 
-### `control clip` (wl-clipboard)
+### `control clip` (the system clipboard)
 
 ```
 control clip set "some text"                     # copy (the text is never echoed back)
@@ -462,12 +570,14 @@ control clip get                                 # print the clipboard
 control clip get --mime text/uri-list
 ```
 
-`--file` (repeatable) copies files the way a file manager does (`text/uri-list`
-with `file://` URIs), which lets a page's paste handler or an upload area take
-them with Ctrl+V instead of going through a file dialog. `--paste` presses
-Ctrl+V right after copying; with `--window` the focus and the paste happen under
-the input lock. Needs `wl-clipboard` (`sudo pacman -S wl-clipboard`; the install
-script adds it).
+`--file` (repeatable) copies files the way a file manager does: on Wayland as
+`text/uri-list` with `file://` URIs, on Windows as `CF_HDROP` (the format
+Explorer and every Windows app expects). Either way a page's paste handler or an
+upload area takes them with Ctrl+V instead of going through a file dialog.
+`--paste` presses Ctrl+V right after copying; with `--window` the focus and the
+paste happen under the input lock. Needs `wl-clipboard` on Wayland
+(`sudo pacman -S wl-clipboard`; the install script adds it) — nothing on
+Windows, where the clipboard is the OS's own.
 
 ### Key names
 
@@ -488,13 +598,14 @@ control key --list --json
 ## Native desktop apps (AT-SPI)
 
 Browsers have the DOM; native apps have the **accessibility tree** — the same
-one screen readers use. Through AT-SPI, `control a11y` lists an app's widgets
-with their role, name, states, available actions and text, reads a field's
-content, and operates widgets by *element* instead of by pixel:
+one screen readers use. Through AT-SPI on Linux, UI Automation on Windows,
+`control a11y` lists an app's widgets with their role, name, states, available
+actions and text, reads a field's content, and operates widgets by *element*
+instead of by pixel:
 
 ```
-control a11y enable                                   # once per login session
-control a11y status                                   # bus on? worker OK? which apps?
+control a11y enable                                   # once per login session (Linux)
+control a11y status                                   # backend OK? which apps publish?
 control a11y tree --window Dolphin --interactive      # what can I operate here?
 control a11y tree --app kate --role "push button" --name Guardar
 control a11y read --window "Correo" --name Asunto     # a field's text, no screenshot
@@ -503,6 +614,9 @@ control a11y focus --app kate --role text && control type "¡Hola, señor!"
 control a11y set-text --app kate --role text "texto nuevo"    # where the app allows it
 control a11y wait --app dolphin --role "list item" --name informe.pdf --settle 300
 ```
+
+The same commands and flags work on both platforms; only the role *names* and
+the toolkit table differ (below).
 
 Output, one element per line — role, name, `[states]`, `{actions}`, text, and
 the element's **path** (child indices from the application, usable as `--path`):
@@ -515,16 +629,21 @@ list item "cap1-vul-003.png" [focused, selected]    /0/0/0/0/0/0/2/0/0/2
 ```
 
 - **Choosing the app:** `--window PATTERN` (the app owning that window, and only
-  that window's frame; nothing is focused), `--app NAME` or `--pid N`.
+  that window's frame; nothing is focused), `--app NAME` or `--pid N`. On Windows
+  `--app` also matches the executable, so `--app notepad` finds the window titled
+  "Sin título".
 - **Choosing the element:** `--path`, or filters `--role`, `--name`, `--text`
   (substrings, case-insensitive), `--state focused` (repeatable),
   `--interactive`, plus `--nth N`. With filters `tree` is a flat list of
   matches. Hidden (not "showing") elements are skipped unless `--all`.
 - **Role names are normalized:** case, CamelCase, `_`/`-` and spacing don't
-  matter, and common spellings map to AT-SPI's own — `PushButton`/`push button`
-  → `button` (at-spi2-core 2.5x renamed it; `button` matches both spellings),
-  `checkbox` → `check box`, `textbox`/`input` → `entry`, `tab` → `page tab`,
-  `menuItem` → `menu item`, `window` → `frame`, `dropdown` → `combo box`.
+  matter, and common spellings map to the platform's own — `PushButton`/`push
+  button` → `button` (at-spi2-core 2.5x renamed it; `button` matches both
+  spellings), `checkbox` → `check box`, `textbox`/`input` → `entry`, `tab` →
+  `page tab`, `menuItem` → `menu item`, `window` → `frame`, `dropdown` →
+  `combo box`. On Windows the same spellings map onto UIA control types, so
+  `--role "push button"` finds a `Button`, `--role entry` an `Edit` and
+  `--role "check box"` a `CheckBox`; a UIA name typed directly works too.
 - **`do` needs no focus and no visibility.** The action runs inside the app, so
   it works on a window on another virtual desktop — the user's screen does not
   move. Apps implement actions themselves: "accepted" does not always mean
@@ -532,17 +651,20 @@ list item "cap1-vul-003.png" [focused, selected]    /0/0/0/0/0/0/2/0/0/2
   confirm the effect with `read`/`wait`/`win wait-settled`.
 - **Coordinates:** `box` is relative to the window. Wayland clients don't know
   where their window is, so AT-SPI can't give screen coordinates; prefer `do`.
+  (UIA does know, so `box` is populated there.)
 - **`wait`** blocks until a match appears (or `--gone`), then with `--settle MS`
   until the app's visible tree has not changed for that long — the native
   counterpart of `browser --wait-loaded`.
+- **A password field is never read back**: `read` returns an empty string and
+  `get` never echoes its value.
 
 ### Setup and what each toolkit exposes
 
-AT-SPI is reached through PyGObject (`gi`), a C extension distributions build
-for *their* Python. Instead of compiling it into the project venv, the tree is
-walked by a small worker (`src/control/_atspi_helper.py`) run by the system
-interpreter, which already has it; it talks JSON with the venv and uses only
-the standard library besides `gi`. Packages (the install script adds them):
+**Linux (AT-SPI).** AT-SPI is reached through PyGObject (`gi`), a C extension
+distributions build for *their* Python. Instead of compiling it into the project
+venv, the tree is walked by a small worker (`src/control/_atspi_helper.py`) run by
+the system interpreter, which already has it; it talks JSON with the venv and uses
+only the standard library besides `gi`. Packages (the install script adds them):
 
 | Distribution | Packages |
 |---|---|
@@ -580,9 +702,10 @@ Input sent mid-animation can land in the wrong place; this replaces the blind
 
 ## Running several agents in parallel
 
-Several agents can drive the same Plasma session at once. Each one gets its own
-**KWin virtual desktop**, browser profile and log. All of them share **one input
-queue**, because keyboard and mouse events go through a single global device.
+Several agents can drive the same desktop session at once. Each one gets its own
+**virtual desktop** (a KWin one under Plasma, a Win32 one on Windows), browser
+profile and log. All of them share **one input queue**, because keyboard and
+mouse events go through a single global device.
 
 ### 1. Give each agent a workspace
 
@@ -597,14 +720,20 @@ for the same name at the same moment and only one desktop is created. Use
 `--desktop N` to pin an existing desktop instead, and `--activate` to switch to
 it.
 
-Each session keeps its state in `~/.local/share/control/sessions/<name>/`:
+Each session keeps its state in `~/.local/share/control/sessions/<name>/`, or
+`%LOCALAPPDATA%\control\sessions\<name>\` on Windows:
 
 | Path | Purpose |
 |---|---|
-| `session.json` | the desktop number/UUID the agent owns |
+| `session.json` | the desktop number/id the agent owns, and whether it is isolated |
 | `browser-profile/` | a separate Chromium profile (cookies, logins, storage) |
 | `control.log` | the agent's own log (`Session.log(...)`) |
 | `.env` *(optional)* | per-agent config, loaded automatically |
+
+> On a Windows build without virtual desktops (anything before 10 1607, most
+> Server editions) `session init` still works and still gives each agent its own
+> profile, log and `.env`, but it reports `isolated: false` and every agent
+> shares desktop 1. Run your agents one after another there.
 
 ### 2. Point each agent at its session
 
@@ -647,9 +776,10 @@ scopes `--window`).
 If `CONTROL_SESSION_ID` names a session that was never initialised, desktop-scoped
 commands fail with an error instead of silently acting on every desktop.
 
-Sessions remember their desktop by KWin UUID, not just by number. When another
-agent removes a desktop, KWin renumbers the ones after it; the session looks its
-UUID up and follows the new number, so it never acts on another agent's desktop.
+Sessions remember their desktop by id (a KWin UUID, a Win32 desktop GUID), not
+just by number. When another agent removes a desktop, the rest are renumbered;
+the session looks its id up and follows the new number, so it never acts on
+another agent's desktop.
 
 `app launch --desktop` claims **only the window that launch created**. It records
 which matching windows already existed and waits for a new one. Launches of the
@@ -661,11 +791,12 @@ then `--env-file`, then the session's `.env`, then the repo `.env`.
 
 ### 3. Input is serialized automatically
 
-`ydotoold` writes to a single kernel `uinput` device. If two agents typed at the
-same time, their keystrokes would mix into one stream. So every `ydotool` call
-takes a file lock on `/tmp/control_input.lock` (`fcntl.flock`, plus a thread
-lock inside each process). Other agents wait for their turn instead of
-interleaving.
+Input goes through a single global device: `ydotoold`'s `uinput` node on Wayland,
+the Win32 input queue on Windows. If two agents typed at the same time, their
+keystrokes would mix into one stream. So every input call takes a file lock
+(`/tmp/control_input.lock` on Linux, `%TEMP%\control_input.lock` on Windows —
+`fcntl.flock` and `msvcrt.locking` respectively, plus a thread lock inside each
+process). Other agents wait for their turn instead of interleaving.
 
 - **Gestures are atomic.** `drag`, `double_click` and `click` with coordinates
   hold the lock for the whole sequence, so no other agent can act between a
@@ -681,11 +812,12 @@ interleaving.
       inp.press_key("enter")
   ```
 
-- **Focus and input are atomic from the CLI.** Keyboard focus is as global as
-  `uinput`. If agent A activated its window and released the lock before typing,
-  agent B could activate its own window in between, and A's text would land in
-  B's window. `--window PATTERN` avoids this: it takes the lock, focuses the
-  window, waits until KWin reports it active, sends the input, then releases.
+- **Focus and input are atomic from the CLI.** Keyboard focus is as global as the
+  input device. If agent A activated its window and released the lock before
+  typing, agent B could activate its own window in between, and A's text would
+  land in B's window. `--window PATTERN` avoids this: it takes the lock, focuses
+  the window, waits until the desktop reports it active, sends the input, then
+  releases.
 
   ```
   control --session agent_1 type "hello" --window kcalc
@@ -708,8 +840,8 @@ agent's input waits.
 
 `win list`, `session status` and `snapshot` never take the input lock, so they
 return immediately even while another agent is typing. They also run their
-`kdotool`/D-Bus calls concurrently with `asyncio`, instead of one after another
-per window.
+per-window lookups concurrently with `asyncio` on Linux; on Windows the answers
+are already in memory, so there is nothing to wait for.
 
 ```
 control session status --json   # which agent owns which desktop, and its windows
@@ -730,7 +862,7 @@ With an active session:
   name and its outcome (`type -> ok`, `win close -> window_not_found`). Arguments
   are never logged, since they can contain typed text or form contents;
 - screenshots go to `sessions/<name>/screenshots/` instead of the shared
-  `/tmp/control-screenshots/`;
+  scratch dir (`/tmp/control-screenshots/`, `%TEMP%\control-screenshots\`);
 - `control browser ...` uses `sessions/<name>/browser-profile/`, so agents never
   share cookies or fight over Chromium's profile lock.
 
@@ -745,10 +877,11 @@ control desktop current
 control win send kcalc 3                     # move a window to desktop 3
 ```
 
-Desktops are created and removed through KWin's `org.kde.KWin.VirtualDesktopManager`
-D-Bus API via `gdbus`, because `kdotool` can't create desktops.
-Numbering: the CLI and `kdotool` count desktops from 1, while KWin's D-Bus API
-counts positions from 0. `windows.Desktop` has both, `.number` and `.position`.
+Desktops are created and removed through KWin's
+`org.kde.KWin.VirtualDesktopManager` D-Bus API via `gdbus` on Linux (kdotool
+can't create desktops), and through `IVirtualDesktopManager` on Windows.
+Numbering: the CLI counts desktops from 1, while both backends report positions
+from 0. `windows.Desktop` has both, `.number` and `.position`.
 
 ### Cleaning up
 
@@ -757,18 +890,18 @@ control session end --name agent_1 --remove-desktop
 ```
 
 This deletes the session record and, with `--remove-desktop`, its virtual
-desktop. KWin moves any remaining windows to another desktop; it does not close
+desktop. The OS moves any remaining windows to another desktop; it does not close
 them. The browser profile and log are kept so you can inspect them afterwards.
 
 ### Throwaway sandboxes and guard rails
 
 ```
-control sandbox -- ./agent_task.sh
+control sandbox -- python run_agent.py
 control sandbox --name qa-run --keep-windows -- python run_checks.py
 ```
 
 ```
-control sandbox --timeout 120 -- ./agent_task.sh     # never runs longer than 2 minutes
+control sandbox --timeout 120 -- python run_agent.py   # never runs longer than 2 minutes
 ```
 
 `control sandbox -- COMMAND...` creates a fresh session on its own virtual
@@ -787,22 +920,22 @@ with `--json`.
 
 `--timeout S` bounds the run. When it expires the shutdown goes from polite to
 firm: the windows the run opened are asked to close (apps get to save or ask),
-then COMMAND's process group gets SIGTERM and, after 5 s, SIGKILL — the group
-includes apps started through `control app launch`, since gtk-launch runs them
-as its children. An app whose window still won't close gets SIGTERM, then
-SIGKILL, *only* if that process owns no window outside the sandbox (a browser
-that opened one sandbox window keeps the user's other windows). The exit status
-is then 124, as with `timeout(1)`.
+then COMMAND's whole tree is stopped — SIGTERM to the process group on Linux,
+`taskkill /T` then `/F` on Windows — after 5 s. The tree includes apps started
+through `control app launch`, which runs them as its children. An app whose
+window still won't close is stopped and then killed, *only* if that process owns
+no window outside the sandbox (a browser that opened one sandbox window keeps
+the user's other windows). The exit status is then 124, as with `timeout(1)`.
 
 Inside any session, commands that would reach outside the session's desktop
 are refused with `session_guard` unless `--force` is given: `desktop switch` to
 another desktop, and `win send` of a window to another desktop.
 
-A limit worth knowing: Wayland input (`type`, `key`, `click`) goes to the
-focused window, and focusing a window on another desktop makes KWin show that
-desktop. Reading and acting through AT-SPI (`a11y read/do/wait`) and CDP
-(`browser ...`) do not need focus, so they keep working on a sandbox desktop
-the user never sees.
+A limit worth knowing: input (`type`, `key`, `click`) goes to the focused
+window, and focusing a window on another desktop makes the compositor show that
+desktop. Reading and acting through the accessibility tree (`a11y read/do/wait`)
+and CDP (`browser ...`) do not need focus, so they keep working on a sandbox
+desktop the user never sees.
 
 ## Machine-readable output for agents
 
@@ -830,7 +963,8 @@ In JSON mode:
 
   `type` is a stable, snake_case identifier to branch on (`window_not_found`,
   `timeout`, `desktop_error`, `lock_timeout`, `session_error`, `unknown_key`,
-  `focus_error`, `kdotool_error`, `ydotool_error`, ...). `hint` is the next command
+  `focus_error`, and per backend `kdotool_error`/`win32_error`,
+  `ydotool_error`/`send_input_error`, ...). `hint` is the next command
   to try.
 - **Usage errors are JSON too** (`"type": "usage_error"`, exit status 2).
 - **Unexpected errors don't print a traceback.** They are reported as

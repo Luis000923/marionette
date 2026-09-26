@@ -3,6 +3,7 @@ and the session/desktop/snapshot orchestration commands."""
 from __future__ import annotations
 
 import json
+import os
 from unittest.mock import patch
 
 import pytest
@@ -153,7 +154,7 @@ class TestSessionCommands:
         data = json.loads(capsys.readouterr().out)
         assert data["name"] == "agent_2"
         assert data["desktop"] == 3
-        assert data["profile_dir"].endswith("agent_2/browser-profile")
+        assert data["profile_dir"].endswith(os.path.join("agent_2", "browser-profile"))
 
     def test_session_init_is_idempotent_across_invocations(self, capsys):
         with patch("control.session.windows.ensure_desktop",

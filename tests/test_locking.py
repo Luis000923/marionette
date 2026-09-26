@@ -1,12 +1,14 @@
 """Tests for the input mutex: the thing that stops parallel agents from
-interleaving their keystrokes on the single global uinput device.
+interleaving their keystrokes on the single global input device.
 
 Concurrency is simulated two ways: threads (which exercise the intra-process
-RLock) and real subprocesses (which exercise the cross-process flock -- the case
-that actually matters, since each agent is its own `control` process).
+RLock) and real subprocesses (which exercise the cross-process file lock --
+`fcntl.flock` on POSIX, `msvcrt.locking` on Windows -- the case that actually
+matters, since each agent is its own `control` process).
 """
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import threading
@@ -14,7 +16,7 @@ import time
 
 import pytest
 
-from control import locking
+from control import locking, platforms
 
 
 @pytest.fixture
@@ -28,10 +30,23 @@ class TestConfiguration:
     def test_lock_path_follows_env(self, lock_file):
         assert locking.lock_path() == lock_file
 
-    def test_lock_path_defaults_to_tmp(self, monkeypatch):
+    def test_lock_path_defaults_to_the_scratch_dir(self, monkeypatch):
         monkeypatch.delenv("CONTROL_INPUT_LOCK", raising=False)
         assert locking.lock_path() == locking.DEFAULT_LOCK_PATH
+        assert locking.DEFAULT_LOCK_PATH == platforms.scratch_dir("control_input.lock")
+
+    @pytest.mark.skipif(os.name != "posix", reason="POSIX scratch dir")
+    def test_lock_path_is_tmp_on_posix(self, monkeypatch):
+        monkeypatch.delenv("CONTROL_INPUT_LOCK", raising=False)
         assert str(locking.DEFAULT_LOCK_PATH) == "/tmp/control_input.lock"
+
+    @pytest.mark.skipif(os.name == "posix", reason="Windows scratch dir")
+    def test_lock_path_is_under_the_windows_temp_dir(self, monkeypatch):
+        monkeypatch.delenv("CONTROL_INPUT_LOCK", raising=False)
+        # A literal "/tmp/control_input.lock" would be a *directory* named /tmp on
+        # Windows, so the scratch dir has to come from the platform.
+        assert locking.DEFAULT_LOCK_PATH.parent == platforms.runtime_dir()
+        assert locking.DEFAULT_LOCK_PATH.name == "control_input.lock"
 
     def test_timeout_falls_back_when_env_is_garbage(self, monkeypatch):
         monkeypatch.setenv("CONTROL_INPUT_LOCK_TIMEOUT", "not-a-number")

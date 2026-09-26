@@ -15,14 +15,22 @@ concurrency:
 
 jobs:
   test:
-    name: pytest (Python 3.12)
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
+    name: pytest (${{ matrix.os }}, Python 3.12)
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        # Both desktop backends are supported, so both are tested: the kdotool /
+        # ydotool / AT-SPI one under Linux, and the Win32 / UI Automation one
+        # under Windows.
+        os: [ubuntu-latest, windows-latest]
 
-    # No Xvfb, fake D-Bus or dummy kdotool/ydotool needed: tests/conftest.py
-    # empties PATH and stubs KWin, so every desktop call is mocked. Any test
-    # that forgets a mock fails with FileNotFoundError instead of passing by
-    # accident. The variables below make sure nothing leaks in from the runner.
+    # No Xvfb, fake D-Bus, dummy kdotool/ydotool or visible desktop needed: every
+    # test that would touch the real one is skipped, and tests/conftest.py empties
+    # PATH and stubs the desktop so a forgotten mock fails loudly instead of
+    # driving the machine. The variables below make sure nothing leaks in from the
+    # runner.
     env:
       DISPLAY: ""
       WAYLAND_DISPLAY: ""
@@ -45,11 +53,20 @@ jobs:
       - name: Install dependencies (incl. dev group)
         # --locked: fail if uv.lock is out of date with pyproject.toml.
         # Playwright's Python package is installed, but no browser binaries:
-        # the tests never launch Chromium.
+        # the tests never launch Chromium. comtypes comes in on Windows only, and
+        # the UIA tests skip themselves if UI Automation is unreachable.
         run: uv sync --locked
 
       - name: Smoke-test the CLI entry point
-        run: .venv/bin/control --help > /dev/null
+        # The console script lands in .venv/bin on POSIX and .venv\Scripts here.
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            .venv/Scripts/control.exe --help > /dev/null
+          else
+            .venv/bin/control --help > /dev/null
+          fi
 
       - name: Run test suite
-        run: .venv/bin/python -m pytest -v
+        shell: bash
+        run: .venv/bin/python -m pytest -v || .venv/Scripts/python.exe -m pytest -v

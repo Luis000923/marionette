@@ -1,12 +1,21 @@
-"""Tests for sudo.py, mocking subprocess.run so no real sudo is ever invoked."""
+"""Tests for sudo.py, mocking subprocess.run so no real sudo is ever invoked.
+
+POSIX-only: `sudo -S` has no Windows counterpart (elevation is the UAC prompt,
+see `run_as_root` in sudo.py), and these assertions are about the password never
+leaking through argv. The Windows elevation path is covered by test_win_native.py.
+"""
 from __future__ import annotations
 
+import os
 import subprocess
 from unittest.mock import patch
 
 import pytest
 
 from control import sudo
+
+pytestmark = pytest.mark.skipif(
+    os.name != "posix", reason="exercises the sudo -S backend (POSIX only)")
 
 
 def _completed(stdout: str = "", stderr: str = "", returncode: int = 0) -> subprocess.CompletedProcess:

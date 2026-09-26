@@ -3,6 +3,7 @@ fake clock -- no Chromium is ever launched."""
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from unittest.mock import patch
 
@@ -666,7 +667,14 @@ class TestFocusAndGoto:
 
     def test_pastes_the_url_when_wl_copy_is_available(self):
         """ydotool types US keycodes: on a Spanish layout "https://" would come out
-        as "httpsÑ--". Pasting is layout-independent."""
+        as "httpsÑ--". Pasting is layout-independent.
+
+        POSIX-only: on Windows the same fallback is not needed, because key
+        events carry the characters themselves (see the test right above).
+        """
+        if os.name == "nt":
+            pytest.skip("Windows types URLs exactly; nothing to paste")
+
         class FakeWindow:
             id, title = "0x1", "Brave"
 

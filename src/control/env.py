@@ -5,14 +5,17 @@ No extra dependency: this is a lightweight CLI tool and the format we need
 
 Two security rules live here:
 
-* **Secrets never reach `os.environ`.** Keys in `SECRET_KEYS` (the sudo
+* **Secrets never reach `os.environ`.** Keys in `SECRET_KEYS` (the elevation
   password) are skipped by `load_env()`; anything that needs one asks
-  `get_secret()`, which reads the file on demand. Otherwise the password would
-  sit in `/proc/<pid>/environ` of this process and be inherited by every child
-  it spawns (gtk-launch, the launched GUI app, Chromium...).
-* **Permissive files are flagged.** An .env readable by group/others triggers a
-  warning, and a secret is never read from such a file (nor from one owned by
-  another user). `CONTROL_ENV_STRICT=1` turns the warning into a hard error.
+  `get_secret()`, which reads the file on demand. Otherwise it would sit in this
+  process's environment -- `/proc/<pid>/environ` on Linux, inherited by every
+  child on Windows -- and reach the GUI apps and Chromium we start.
+* **Permissive files are flagged.** On POSIX that is the mode bits: an .env
+  readable by group/others triggers a warning, and a secret is never read from
+  such a file (nor from one owned by another user). On Windows mode bits say
+  nothing (every file reports 0666 whatever its ACLs are), so the check is
+  whether the file lives in the user's own profile, which is private by
+  default. `CONTROL_ENV_STRICT=1` turns the warning into a hard error.
 """
 from __future__ import annotations
 
@@ -20,6 +23,8 @@ import os
 import stat
 import sys
 from pathlib import Path
+
+from . import platforms
 
 # repo root: src/control/env.py -> src/control -> src -> repo root
 _DEFAULT_ENV_PATH = Path(__file__).resolve().parent.parent.parent / ".env"
@@ -66,11 +71,33 @@ def strict_mode() -> bool:
 def permission_problem(path: Path) -> str | None:
     """Why `path` is unsafe to hold secrets, or None if it's fine (0600, ours)."""
     st = path.stat()
+    if platforms.IS_WINDOWS:
+        return _windows_permission_problem(path)
     if st.st_uid != os.getuid():
         return f"{path} is owned by uid {st.st_uid}, not by you"
     if st.st_mode & (stat.S_IRWXG | stat.S_IRWXO):
         return f"{path} has mode {stat.S_IMODE(st.st_mode):04o}; fix it with: chmod 600 {path}"
     return None
+
+
+def _windows_permission_problem(path: Path) -> str | None:
+    """A file is private on Windows when it sits in the user's own profile.
+
+    Every Windows file reports mode 0666 regardless of its ACLs, so the mode bits
+    would either reject every .env or none. What actually decides it is where the
+    file is: `%USERPROFILE%` and below inherit an ACL that only the user (and
+    administrators) can read, while anything in a shared or world-writable place
+    (a repo under `C:\\Users\\Public`, a synced folder) is not private at all.
+    """
+    try:
+        home = Path(os.environ.get("USERPROFILE") or Path.home()).resolve()
+        resolved = path.resolve()
+    except OSError:  # pragma: no cover - a path we cannot even resolve
+        return f"{path} cannot be resolved, so its privacy cannot be checked"
+    if resolved == home or home in resolved.parents:
+        return None
+    return (f"{path} is outside your user profile, where it is not private; move it to "
+            f"{home} or keep secrets out of it")
 
 
 def _check_permissions(path: Path) -> None:

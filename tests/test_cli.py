@@ -6,6 +6,7 @@ subprocess call or filesystem app scan happens.
 from __future__ import annotations
 
 import json
+import os
 from unittest.mock import patch
 
 import pytest
@@ -136,17 +137,23 @@ class TestMainErrorHandling:
         assert "[ERROR] kdotool_error" in err
         assert "kdotool" in err.lower()
 
-    def test_main_reports_ydotool_error_friendly(self, capsys):
+    def test_main_reports_input_error_friendly(self, capsys):
+        """An input failure is reported with the advice for *this* backend."""
         with patch("control.cli.bootstrap"), patch("control.cli.build_parser") as mock_build:
             parser = mock_build.return_value
             fake_args = parser.parse_args.return_value
-            fake_args.func.side_effect = cli.inp.YdotoolError("daemon not running")
+            if os.name == "nt":
+                fake_args.func.side_effect = cli.inp.SendInputError("input was refused")
+                expected_type, expected_word = "send_input_error", "administrator"
+            else:
+                fake_args.func.side_effect = cli.inp.YdotoolError("daemon not running")
+                expected_type, expected_word = "ydotool_error", "ydotoold"
             with pytest.raises(SystemExit) as exc_info:
                 cli.main()
         assert exc_info.value.code == 1
         err = capsys.readouterr().err
-        assert "[ERROR] ydotool_error" in err
-        assert "ydotoold" in err
+        assert f"[ERROR] {expected_type}" in err
+        assert expected_word in err
 
     def test_main_reports_app_launch_error_friendly(self, capsys):
         with patch("control.cli.bootstrap"), patch("control.cli.build_parser") as mock_build:
