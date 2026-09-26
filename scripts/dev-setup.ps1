@@ -20,8 +20,18 @@ if (-not (Test-Path $python)) {
 
 function Invoke-Control { & $python -m control.cli @args }
 
+# Chromium is the one optional piece: it is only needed by `control browser`,
+# and its CDN is not always reachable (proxy, TLS interception, offline). So a
+# failed download is reported and stepped over, not treated as a broken install
+# -- otherwise this script cannot smoke-test anything on such a machine.
+$browserReady = $true
 & $python -m playwright install chromium
-if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+if ($LASTEXITCODE -ne 0) {
+    $browserReady = $false
+    Write-Host "Playwright's Chromium did not download (network, proxy or TLS)." -ForegroundColor Yellow
+    Write-Host "  'control browser' will not work until it does; everything else will." -ForegroundColor Yellow
+    Write-Host "  Retry with: $python -m playwright install chromium" -ForegroundColor DarkGray
+}
 
 # A smoke test that cannot touch the real desktop: --help, then a JSON usage
 # error, then one read-only query against the real window list.
@@ -35,3 +45,7 @@ if ($LASTEXITCODE -ne 0) {
     exit 1
 }
 Write-Host "win list ok -- you are ready to drive this desktop." -ForegroundColor Green
+
+if ($browserReady) {
+    Write-Host "browser ok -- 'control browser' is ready too." -ForegroundColor Green
+}
