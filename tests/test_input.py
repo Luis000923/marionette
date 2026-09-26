@@ -1,12 +1,20 @@
-"""Tests for input.py, mocking subprocess.run so no real ydotool is invoked."""
+"""Tests for input.py, mocking subprocess.run so no real ydotool is invoked.
+
+POSIX-only: these assert the exact ydotool command lines. The Windows backend
+types through SendInput and pastes through user32 instead; see test_win_native.py.
+"""
 from __future__ import annotations
 
+import os
 import subprocess
 from unittest.mock import patch
 
 import pytest
 
 from control import input as inp
+
+pytestmark = pytest.mark.skipif(
+    os.name != "posix", reason="exercises the ydotool/wl-clipboard backend (POSIX only)")
 
 
 def _completed(stdout: str = "", stderr: str = "", returncode: int = 0) -> subprocess.CompletedProcess:

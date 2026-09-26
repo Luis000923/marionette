@@ -1,40 +1,51 @@
 """Per-agent sessions: one virtual desktop, one browser profile, one log, one .env.
 
 A "session" is the unit of isolation for running several agents in parallel on a
-single Plasma desktop. Each one pins:
+single desktop. Each one pins:
 
-* a KWin virtual desktop (`control:<name>` unless told otherwise), so window
-  commands can be scoped with `--desktop` and agents never see each other's
-  windows;
-* a state directory under `~/.local/share/control/sessions/<name>/`, holding a
-  `session.json` record, a dedicated Chromium profile and a log file.
+* a virtual desktop (`control:<name>` unless told otherwise) -- a KWin one under
+  Plasma, a Win32 one on Windows -- so window commands can be scoped with
+  `--desktop` and agents never see each other's windows;
+* a state directory under `%LOCALAPPDATA%\\control\\sessions\\<name>\\` on Windows
+  (`~/.local/share/control/sessions/<name>/` elsewhere), holding a `session.json`
+  record, a dedicated Chromium profile and a log file.
 
 Sessions are picked up implicitly from `CONTROL_SESSION_ID`, so a terminal can
-`export CONTROL_SESSION_ID=agent_1` once and every later `control` command in
-that shell stays inside agent 1's desktop and profile.
+set it once and every later `control` command in that shell stays inside that
+agent's desktop and profile.
 
-Input is *not* isolated per session -- uinput is global hardware, so all agents
-serialize on the single lock in locking.py.
+Input is *not* isolated per session -- the input device is global hardware, so
+all agents serialize on the single lock in locking.py.
 """
 from __future__ import annotations
 
 import asyncio
 import json
 import os
-import signal
+import re
 import subprocess
 import time
 import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-from . import windows
+from . import platforms, windows
 from .locking import FileMutex
+from .windows import Desktop
 
-DEFAULT_STATE_DIR = Path.home() / ".local/share/control/sessions"
+if platforms.IS_WINDOWS:
+    from . import winapi as _win
+else:
+    import signal
+    _win = None
+
+DEFAULT_STATE_DIR = platforms.state_dir() / "sessions"
 #: Prefix for auto-created virtual desktops, so `desktop list` shows who owns what.
 DESKTOP_PREFIX = "control:"
 _RECORD_NAME = "session.json"
+#: Characters a name may not contain, because they would break either a path
+#: component (POSIX) or the Win32 naming rules, both of which end in a ":".
+_INVALID_NAME_CHARS = re.compile(r'[/\\:*?"<>|]')
 
 
 class SessionError(RuntimeError):
@@ -77,6 +88,9 @@ class Session:
     desktop_name: str = ""
     created_at: float = field(default_factory=time.time)
     pid: int = 0
+    #: False when the platform has only one desktop to hand out: the session
+    #: still exists (own profile, log and .env), but its windows are not isolated.
+    isolated: bool = True
 
     @property
     def dir(self) -> Path:
@@ -154,10 +168,11 @@ def init(name: str, desktop: int | str | None = None, desktop_name: str | None =
     `desktop` pins an existing desktop number, or names one (created if
     missing); otherwise a desktop named `control:<name>` is created on demand.
     """
-    if not name or "/" in name or name.startswith("."):
+    if not name or _INVALID_NAME_CHARS.search(name) or name.startswith("."):
         raise SessionError(f"invalid session name {name!r}")
 
     with _allocation_lock():
+        isolated = windows.virtual_desktops_available()
         if desktop is not None and str(desktop).isdigit():
             target = windows.find_desktop(int(desktop))
             if target is None:
@@ -166,6 +181,11 @@ def init(name: str, desktop: int | str | None = None, desktop_name: str | None =
             target = windows.ensure_desktop(str(desktop))
         else:
             target = windows.ensure_desktop(desktop_name or desktop_name_for(name))
+        if not isolated and desktop is None:
+            # One desktop for everybody: keep the wanted name in the record so the
+            # log and `session status` say what isolation *would* have been.
+            target = Desktop(position=target.position, id=target.id,
+                            name=desktop_name or desktop_name_for(name))
 
         existing = load(name)
         session = Session(
@@ -175,10 +195,16 @@ def init(name: str, desktop: int | str | None = None, desktop_name: str | None =
             desktop_name=target.name,
             created_at=existing.created_at if existing else time.time(),
             pid=os.getpid(),
+            isolated=isolated,
         )
         session.save()
     session.profile_dir.mkdir(parents=True, exist_ok=True)
-    session.log(f"session init on desktop {target.number} ({target.name!r})")
+    if isolated:
+        session.log(f"session init on desktop {target.number} ({target.name!r})")
+    else:
+        session.log(f"session init on desktop {target.number}, NOT isolated: "
+                    + (windows.virtual_desktops_hint() or
+                       "the platform has a single virtual desktop"))
     if activate:
         windows.set_desktop(target.number)
     return session
@@ -202,16 +228,17 @@ def _list_live_desktops() -> list[windows.Desktop]:
 
 
 def current_desktop_number(session: Session) -> int | None:
-    """The session's desktop number *now*, re-resolved through its KWin UUID.
+    """The session's desktop number *now*, re-resolved through its backend id.
 
-    Numbers are positions: when another agent removes a desktop before ours,
-    KWin renumbers everything after it, and a stale number would send this
-    agent's windows onto someone else's desktop. The UUID doesn't move, so we
-    look it up and refresh the record when the number drifted. If KWin can't be
-    asked at all, the recorded number is the best we have.
+    Numbers are positions: when another agent removes a desktop before ours, KWin
+    renumbers everything after it, and a stale number would send this agent's
+    windows onto someone else's desktop. The id (a KWin UUID, a Win32 desktop
+    GUID) doesn't move, so we look it up and refresh the record when the number
+    drifted. If the desktop manager can't be asked at all, the recorded number is
+    the best we have.
     """
     if not session.desktop_id:
-        return session.desktop
+        return session.desktop  # nothing to re-resolve: the platform has one desktop
     try:
         desktops = _list_live_desktops()
     except (windows.DesktopError, OSError, subprocess.SubprocessError):
@@ -315,7 +342,7 @@ def _windows_on(desktop: int) -> list[windows.Window]:
         try:
             if win.get_desktop() == desktop:
                 found.append(win)
-        except windows.KdotoolError:
+        except windows.WINDOW_ERRORS:
             continue  # gone meanwhile
     return found
 
@@ -338,11 +365,12 @@ def sandbox(command: list[str], name: str | None = None, keep_windows: bool = Fa
 
     With `timeout` (seconds), a command still running then is stopped in order:
     first the windows it opened are asked to close (apps get to save or ask),
-    then its process group gets SIGTERM, and SIGKILL after SANDBOX_TERM_GRACE.
-    The group includes apps started with gtk-launch, which runs them as its
-    children. An app whose window still ignores the close is sent SIGTERM, then
-    SIGKILL -- but only when that process owns no window outside the sandbox
-    (a browser that opened one sandbox window keeps the user's other windows).
+    then its process group is asked to stop, and killed after SANDBOX_TERM_GRACE
+    if it did not. The group includes apps started through `control app launch`,
+    which runs them as its children. An app whose window still ignores the close
+    is stopped and then killed -- but only when that process owns no window
+    outside the sandbox (a browser that opened one sandbox window keeps the
+    user's other windows).
     """
     name = name or f"sandbox-{uuid.uuid4().hex[:6]}"
     session = init(name)
@@ -369,8 +397,9 @@ def _run_command(command: list[str], env: dict[str, str], timeout: float | None,
     before any signal is sent (the polite part of the shutdown)."""
     if timeout is None:
         return subprocess.run(command, env=env).returncode, False
-    # Its own process group, so the whole tree it spawned can be signalled at once.
-    proc = subprocess.Popen(command, env=env, start_new_session=True)
+    # Its own group, so the whole tree it spawned can be stopped at once: a new
+    # session on POSIX, a new process group on Windows.
+    proc = subprocess.Popen(command, env=env, **_own_group_kwargs())
     try:
         return proc.wait(timeout=timeout), False
     except subprocess.TimeoutExpired:
@@ -385,6 +414,13 @@ def _run_command(command: list[str], env: dict[str, str], timeout: float | None,
         raise
 
 
+def _own_group_kwargs() -> dict:
+    """Popen kwargs that put the child in a group of its own, per platform."""
+    if platforms.IS_WINDOWS:
+        return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+    return {"start_new_session": True}
+
+
 def _signal_group(pgid: int, sig: int) -> bool:
     try:
         os.killpg(pgid, sig)
@@ -393,16 +429,34 @@ def _signal_group(pgid: int, sig: int) -> bool:
         return False
 
 
+def _terminate_tree(pid: int, force: bool) -> bool:
+    """Stop a process and its children. False when there was nothing left to stop.
+
+    POSIX signals the process group; Windows has no signals, so the ladder is
+    `taskkill /T` (closes GUI windows, ends console apps) and then `taskkill
+    /T /F` for whatever ignored that.
+    """
+    if _win is not None:
+        if not _win.process_alive(pid):
+            return False
+        try:
+            _win.terminate_process_tree(pid, force=force)
+        except _win.Win32Error:
+            return not _win.process_alive(pid)
+        return True
+    return _signal_group(pid, signal.SIGKILL if force else signal.SIGTERM)
+
+
 def _stop_group(proc: subprocess.Popen) -> None:
-    """SIGTERM the command's process group, SIGKILL whatever is left after the grace."""
-    if not _signal_group(proc.pid, signal.SIGTERM):
+    """Stop the command's whole tree: ask first, insist after the grace period."""
+    if not _terminate_tree(proc.pid, force=False):
         return
     try:
         proc.wait(timeout=SANDBOX_TERM_GRACE)
     except subprocess.TimeoutExpired:
         pass
-    # Also reaches children that outlived a leader which exited on SIGTERM.
-    _signal_group(proc.pid, signal.SIGKILL)
+    # Also reaches children that outlived a leader which exited on the first ask.
+    _terminate_tree(proc.pid, force=True)
     try:
         proc.wait(timeout=SANDBOX_KILL_GRACE)
     except subprocess.TimeoutExpired:
@@ -421,7 +475,7 @@ def _killable_pids(stubborn: list[windows.Window], ours: set[str]) -> set[int]:
     for win in stubborn:
         try:
             pid = win.pid()
-        except windows.KdotoolError:
+        except windows.WINDOW_ERRORS:
             continue
         if pid and pid not in (os.getpid(), 1):
             pids.setdefault(pid, [])
@@ -430,7 +484,7 @@ def _killable_pids(stubborn: list[windows.Window], ours: set[str]) -> set[int]:
             continue
         try:
             pid = windows.Window(win_id).pid()
-        except windows.KdotoolError:
+        except windows.WINDOW_ERRORS:
             continue
         if pid in pids:
             pids[pid].append(win_id)  # this process also shows something of the user's
@@ -439,18 +493,14 @@ def _killable_pids(stubborn: list[windows.Window], ours: set[str]) -> set[int]:
 
 def _kill_apps(pids: set[int], desktop: int, ids: set[str]) -> list[int]:
     killed = []
-    for sig, grace in ((signal.SIGTERM, SANDBOX_KILL_GRACE), (signal.SIGKILL, SANDBOX_KILL_GRACE)):
+    for force in (False, True):
         alive = [w for w in _windows_on(desktop) if w.id in ids]
         if not alive:
             break
         for pid in pids:
-            try:
-                os.kill(pid, sig)
-                if pid not in killed:
-                    killed.append(pid)
-            except (ProcessLookupError, PermissionError):
-                pass
-        _wait_gone(desktop, ids, grace)
+            if _terminate_tree(pid, force=force) and pid not in killed:
+                killed.append(pid)
+        _wait_gone(desktop, ids, SANDBOX_KILL_GRACE)
     return killed
 
 
@@ -462,7 +512,7 @@ def _close_new_windows(session: Session, before: set[str]) -> list[str]:
         try:
             win.close()
             closed.append(win.id)
-        except windows.KdotoolError:
+        except windows.WINDOW_ERRORS:
             pass
     _wait_gone(session.desktop, {w.id for w in ours}, SANDBOX_CLOSE_TIMEOUT)
     return closed

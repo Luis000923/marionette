@@ -1,13 +1,17 @@
 [project]
 name = "marionette"
 version = "0.1.0"
-description = "Full desktop control for KDE Plasma on Wayland: windows, input, screenshots, apps, and browser automation."
+description = "Full desktop control for Windows and KDE Plasma: windows, input, screenshots, apps, and browser automation."
 authors = [
     { name = "Luis000923", email = "cruncron@gmail.com" }
 ]
 requires-python = ">=3.12"
 dependencies = [
     "playwright>=1.47",
+    # UI Automation (control a11y) is COM, and comtypes is the one pure-Python
+    # bridge that needs no compiled wheel. Windows-only: on Linux the same CLI
+    # is answered by AT-SPI, which needs no Python dependency at all.
+    "comtypes>=1.2 ; sys_platform == 'win32'",
 ]
 
 [project.scripts]

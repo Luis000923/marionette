@@ -1,13 +1,21 @@
 """Tests for apps.py, mocking subprocess.run and windows.wait_for_window so no real
-gtk-launch/kdotool call happens."""
+gtk-launch/kdotool call happens.
+
+POSIX-only: the assertions are about the .desktop catalog and gtk-launch. The
+Windows catalog (Start Menu shortcuts) is covered by test_win_native.py.
+"""
 from __future__ import annotations
 
+import os
 import subprocess
 from unittest.mock import patch
 
 import pytest
 
 from control import apps, windows
+
+pytestmark = pytest.mark.skipif(
+    os.name != "posix", reason="exercises the .desktop/gtk-launch backend (POSIX only)")
 
 
 def _completed(stdout: str = "", stderr: str = "", returncode: int = 0) -> subprocess.CompletedProcess:

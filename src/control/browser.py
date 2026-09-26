@@ -1,5 +1,8 @@
 """Precise, DOM-level browser control via Playwright (persistent Chromium profile).
 
+Works the same on both desktop platforms: Playwright ships and drives its own
+Chromium, so nothing here is platform-specific beyond where the profile lives.
+
 When a session is active (CONTROL_SESSION_ID), the profile lives inside that
 session's directory instead of the shared one: parallel agents then keep
 separate cookies, logins and local storage, and Chromium never refuses to start
@@ -27,11 +30,14 @@ from urllib.parse import urlparse
 
 from playwright.sync_api import BrowserContext, Page, sync_playwright
 
+from . import platforms
+
 if TYPE_CHECKING:
     from . import windows
 
-#: Shared profile, used when no session is active (unchanged default).
-PROFILE_DIR = Path.home() / ".local/share/control/browser-profile"
+#: Shared profile, used when no session is active. Under `%LOCALAPPDATA%\control`
+#: on Windows, `~/.local/share/control` elsewhere.
+PROFILE_DIR = platforms.state_dir() / "browser-profile"
 
 
 def profile_dir(session_name: str | None = None) -> Path:
@@ -1158,21 +1164,24 @@ def focus_and_goto(window: "windows.Window", url: str) -> str:
     and press Enter (`input.py`). Works on any browser, but is blind -- no
     selectors, no return value beyond how the URL was entered.
 
-    The URL is pasted from the Wayland clipboard when wl-copy is available:
-    `ydotool type` sends US-layout keycodes, so on any other layout ':' and '/'
-    come out as other characters (on a Spanish one, "https://" turns into
-    "httpsÑ--" and the browser searches for it). Pasting replaces the user's
-    clipboard contents. Returns "paste" or "type".
+    The URL is pasted from the clipboard when the platform can type it exactly
+    anyway. `ydotool type` sends US-layout keycodes, so on a non-US layout ':'
+    and '/' come out as other characters (on a Spanish one, "https://" turns into
+    "httpsÑ--" and the browser searches for it); Windows types Unicode directly
+    and needs no paste. Pasting replaces the user's clipboard contents, which is
+    why it is the fallback and not the default. Returns "paste" or "type".
     """
     from . import input as inp
 
     if not window.focus():
         raise BrowserError(
             f"window {window.id} ({window.title!r}) did not take focus",
-            hint="KWin focus-stealing prevention may be blocking it; "
-                 "try 'control win activate' first",
+            hint=("the desktop refused the focus change; try 'control win activate' first"
+                  if platforms.IS_WINDOWS else
+                  "KWin focus-stealing prevention may be blocking it; "
+                  "try 'control win activate' first"),
         )
-    # URLs always hold ':' and '/', so this pastes whenever wl-copy exists.
+    # URLs always hold ':' and '/', so on Linux this pastes whenever wl-copy exists.
     method, _warning = inp.choose_text_method(url)
     with inp.input_lock():
         inp.key_combo("ctrl", "l")

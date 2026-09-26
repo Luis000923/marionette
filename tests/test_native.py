@@ -1,6 +1,11 @@
 """Tests for native-desktop automation: the AT-SPI worker's tree logic (on fake
 nodes), the venv-side bridge, the `a11y` CLI, key names, session guard rails,
-ephemeral sandboxes and window settling. Nothing touches the real bus or KWin."""
+ephemeral sandboxes and window settling. Nothing touches the real bus or KWin.
+
+POSIX-only: it drives the AT-SPI worker (`_atspi_helper.py`), which speaks to
+libatspi over D-Bus. On Windows the same CLI is answered by UI Automation; that
+side is covered by test_win_native.py.
+"""
 from __future__ import annotations
 
 import json
@@ -19,6 +24,9 @@ from control import input as inp
 
 from .test_browser_ai import FakeClock, _main
 from .test_cli_multiagent import _desktop, _run
+
+pytestmark = pytest.mark.skipif(
+    os.name != "posix", reason="exercises the AT-SPI worker (POSIX only)")
 
 
 # --- a fake accessibility tree -----------------------------------------------------------

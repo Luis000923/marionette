@@ -1,14 +1,23 @@
 """Spanish (and any Unicode) text must reach the target app byte-exact.
 
-`ydotool type` sends US-layout keycodes for ASCII and drops everything else, so
-on a Spanish layout "presentación a:b/c" arrived as "presentacin aÑb-c". Text
-with accents, ñ or symbols is pasted through the Wayland clipboard instead, and
-the CLI keeps UTF-8 intact from argv/stdin to wl-copy whatever the locale says.
+How that is achieved differs by backend, and the tests say which one they hold
+for:
+
+* **Wayland** -- `ydotool type` sends US-layout keycodes for ASCII and drops
+  everything else, so on a Spanish layout "presentación a:b/c" arrived as
+  "presentacin aÑb-c". Anything with accents, ñ or symbols is pasted through the
+  clipboard instead, and the CLI keeps UTF-8 intact from argv/stdin to wl-copy
+  whatever the locale says;
+* **Windows** -- key events carry the characters themselves, so the same text is
+  *typed* and comes out exactly, clipboard untouched (only characters outside the
+  Basic Multilingual Plane, i.e. emoji, have to be pasted). argv and stdout are
+  UTF-16 there, so the locale repairs below do not apply.
 """
 from __future__ import annotations
 
 import io
 import json
+import os
 import subprocess
 import sys
 from unittest.mock import patch
@@ -22,6 +31,11 @@ from .test_browser_ai import _main
 
 SPANISH = "¿Qué tal? Año nuevo: señor Núñez, pingüino, acción ¡ya! «comillas» — 5 €"
 ACCENTS = "áéíóúÁÉÍÓÚñÑüÜ¿¡"
+#: Typed exactly on Windows, pasted on Wayland.
+TYPED_ON_WINDOWS = ["Hola mundo", "Linea 1\nLinea 2", "abc, 123.", "", SPANISH, ACCENTS,
+                    "a:b/c", "user@mail.com", "(x)", "€", "日本"]
+#: Pasted on both: ydotool cannot type them, and a key event cannot carry them.
+PASTED_ON_BOTH = ["🙂", "\U0001F600\U0001F44B"]
 
 
 def _completed(stdout=b"", stderr=b"", returncode=0):
@@ -31,32 +45,58 @@ def _completed(stdout=b"", stderr=b"", returncode=0):
 # --- choosing typing vs pasting ------------------------------------------------------
 
 class TestChooseMethod:
-    @pytest.mark.parametrize("text", ["Hola mundo", "Linea 1\nLinea 2", "abc, 123.", ""])
-    def test_layout_safe_text_is_typed(self, text):
+    @pytest.mark.parametrize("text", TYPED_ON_WINDOWS)
+    def test_text_a_key_event_can_carry_is_typed(self, text):
+        # On Wayland only the layout-safe subset of this list is typed, so the
+        # assertion is narrowed there; see TestChooseMethodWayland below.
+        if os.name != "nt" and not all(ch in inp._LAYOUT_SAFE for ch in text):
+            pytest.skip("ydotool would drop or remap these characters")
         with patch("control.input.clipboard_available", return_value=True):
             assert inp.choose_text_method(text) == ("type", None)
 
+    @pytest.mark.parametrize("text", PASTED_ON_BOTH)
+    def test_characters_no_key_event_can_carry_are_pasted(self, text):
+        with patch("control.input.clipboard_available", return_value=True):
+            assert inp.choose_text_method(text) == ("paste", None)
+
+    @pytest.mark.skipif(os.name != "posix", reason="ydotool drops non-ASCII")
     @pytest.mark.parametrize("text", ["presentación", "aquí", "niño", "¿qué?", "pingüino",
-                                      "a:b/c", "user@mail.com", "(x)", "€", "日本", "🙂"])
+                                      "a:b/c", "user@mail.com", "(x)", "€", "日本"])
     def test_anything_ydotool_would_drop_or_remap_is_pasted(self, text):
         with patch("control.input.clipboard_available", return_value=True):
             assert inp.choose_text_method(text) == ("paste", None)
 
+    @pytest.mark.skipif(os.name == "posix", reason="Windows has no missing clipboard")
+    @pytest.mark.parametrize("text", PASTED_ON_BOTH)
+    def test_the_clipboard_is_always_available_on_windows(self, text):
+        assert inp.clipboard_available() is True
+        assert inp.choose_text_method(text) == ("paste", None)
+
+    @pytest.mark.skipif(os.name != "posix", reason="wl-clipboard missing")
     def test_accents_without_wl_clipboard_fail_instead_of_losing_characters(self):
         with patch("control.input.clipboard_available", return_value=False):
             with pytest.raises(inp.ClipboardError, match="wl-clipboard") as exc:
                 inp.choose_text_method("presentación niño")
         assert "ó" in str(exc.value) and "ñ" in str(exc.value)
 
+    @pytest.mark.skipif(os.name != "posix", reason="wl-clipboard missing")
     def test_ascii_symbols_without_wl_clipboard_are_typed_with_a_warning(self):
         with patch("control.input.clipboard_available", return_value=False):
             method, warning = inp.choose_text_method("a:b/c")
         assert method == "type" and "US keyboard layout" in warning
 
+    @pytest.mark.skipif(os.name != "posix", reason="ydotool drops non-ASCII")
     def test_forcing_type_warns_which_characters_will_be_dropped(self):
         method, warning = inp.choose_text_method("año", "type")
         assert method == "type" and "ñ" in warning
 
+    @pytest.mark.skipif(os.name == "posix", reason="Windows has no missing clipboard")
+    def test_forcing_type_warns_about_characters_it_cannot_carry(self):
+        method, warning = inp.choose_text_method("hola \U0001F600", "type")
+        assert method == "type" and "\U0001F600" in warning
+        assert inp.choose_text_method("hola señor", "type") == ("type", None)
+
+    @pytest.mark.skipif(os.name != "posix", reason="wl-clipboard missing")
     def test_forcing_paste_needs_wl_clipboard(self):
         with patch("control.input.clipboard_available", return_value=False):
             with pytest.raises(inp.ClipboardError):
@@ -66,6 +106,7 @@ class TestChooseMethod:
 # --- the clipboard keeps UTF-8 byte-exact ---------------------------------------------
 
 class TestClipboardBytes:
+    @pytest.mark.skipif(os.name == "nt", reason="wl-copy backend")
     def test_copy_sends_utf8_bytes(self):
         with patch("control.input.shutil.which", return_value="/usr/bin/wl-copy"), \
              patch("control.input.subprocess.run", return_value=_completed()) as run:
@@ -73,6 +114,7 @@ class TestClipboardBytes:
         assert run.call_args[1]["input"] == SPANISH.encode("utf-8")
         assert run.call_args[1]["input"].decode("utf-8") == SPANISH
 
+    @pytest.mark.skipif(os.name == "nt", reason="wl-paste backend")
     def test_read_decodes_utf8_whatever_the_locale(self, monkeypatch):
         monkeypatch.setenv("LANG", "es_ES.ISO-8859-1")
         with patch("control.input.shutil.which", return_value="/usr/bin/wl-paste"), \
@@ -81,6 +123,7 @@ class TestClipboardBytes:
             assert inp.read_clipboard() == ACCENTS
         assert "text" not in run.call_args[1]  # bytes, not the locale's decoding
 
+    @pytest.mark.skipif(os.name == "nt", reason="wl-copy backend")
     def test_mojibake_never_appears_in_a_round_trip(self):
         stored = {}
 
@@ -133,18 +176,23 @@ class TestPasteText:
         assert [e for e in events if isinstance(e, tuple) and e[0] == "copy"] == [("copy", "año", None)]
 
     def test_the_whole_paste_is_one_input_gesture(self):
-        depths = []
+        """Copy and Ctrl+V happen under one hold: no other agent can cut in between."""
+        held = []
         with patch("control.input._save_clipboard", return_value=None), \
-             patch("control.input.copy_to_clipboard"), \
-             patch("control.input._sleep"), \
-             patch("control.input.subprocess.run",
-                   side_effect=lambda *a, **k: depths.append(inp.input_mutex._depth) or _completed()):
+             patch("control.input.copy_to_clipboard",
+                   side_effect=lambda *a, **k: held.append(inp.input_mutex.held)), \
+             patch("control.input.key_combo",
+                   side_effect=lambda *k: held.append(inp.input_mutex.held)), \
+             patch("control.input._sleep"):
             inp.paste_text("ñ")
-        assert depths and all(d >= 2 for d in depths)
+        assert held == [True, True]
+        assert not inp.input_mutex.held  # released afterwards
 
     @pytest.mark.parametrize("cls,keys", [("kitty", ("ctrl", "shift", "v")),
                                           ("org.kde.konsole", ("ctrl", "shift", "v")),
-                                          ("brave-browser", ("ctrl", "v")),
+                                          ("CASCADIA_HOSTING_WINDOW_CLASS WindowsTerminal.exe",
+                                           ("ctrl", "shift", "v")),
+                                          ("brave-browser chrome", ("ctrl", "v")),
                                           (None, ("ctrl", "v"))])
     def test_terminals_paste_with_ctrl_shift_v(self, cls, keys):
         assert inp.paste_keys_for(cls) == keys
@@ -162,19 +210,32 @@ class TestTypeCommand:
                             lambda text, delay_ms=0: calls.append(("type", text)))
         return calls
 
-    def test_spanish_text_is_pasted_byte_exact(self, monkeypatch, capsys):
+    def test_spanish_text_reaches_the_app_byte_exact(self, monkeypatch, capsys):
+        """Whatever the backend, the text goes in whole and only its length is echoed."""
         calls = self._patch(monkeypatch)
         assert _main(["--json", "type", SPANISH], monkeypatch) == 0
-        assert calls == [("paste", SPANISH, ("ctrl", "v"))]
         data = json.loads(capsys.readouterr().out)
-        assert data["method"] == "paste" and data["chars"] == len(SPANISH)
-        assert data["clipboard_restored"] is True
+        assert data["chars"] == len(SPANISH)
+        if os.name == "nt":
+            # A key event carries ñ, ¿, « » and € exactly: typed, clipboard untouched.
+            assert calls == [("type", SPANISH)] and data["method"] == "type"
+        else:
+            assert calls == [("paste", SPANISH, ("ctrl", "v"))]
+            assert data["method"] == "paste" and data["clipboard_restored"] is True
 
     def test_plain_text_is_still_typed(self, monkeypatch, capsys):
         calls = self._patch(monkeypatch)
         _main(["--json", "type", "Hola mundo"], monkeypatch)
         assert calls == [("type", "Hola mundo")]
 
+    @pytest.mark.skipif(os.name == "posix", reason="Windows always has a clipboard")
+    def test_emoji_are_pasted_because_no_key_event_can_carry_them(self, monkeypatch, capsys):
+        calls = self._patch(monkeypatch)
+        _main(["--json", "type", "hola \U0001F600"], monkeypatch)
+        assert calls == [("paste", "hola \U0001F600", ("ctrl", "v"))]
+        assert json.loads(capsys.readouterr().out)["method"] == "paste"
+
+    @pytest.mark.skipif(os.name == "nt", reason="Windows has no missing clipboard")
     def test_no_wl_clipboard_is_a_clear_error_and_nothing_is_typed(self, monkeypatch, capsys):
         calls = self._patch(monkeypatch, available=False)
         assert _main(["--json", "type", "presentación"], monkeypatch) == 1
@@ -182,6 +243,7 @@ class TestTypeCommand:
         assert err["type"] == "clipboard_error" and "wl-clipboard" in err["hint"]
         assert calls == []
 
+    @pytest.mark.skipif(os.name == "nt", reason="Windows drops nothing when typing")
     def test_method_type_is_honoured_with_a_warning(self, monkeypatch, capsys):
         calls = self._patch(monkeypatch)
         _main(["--json", "type", "año", "--method", "type"], monkeypatch)
@@ -189,6 +251,7 @@ class TestTypeCommand:
         assert calls == [("type", "año")]
         assert "ñ" in json.loads(out.out)["warning"] and "[WARN]" in out.err
 
+    @pytest.mark.skipif(os.name == "nt", reason="pasting is not the default there")
     def test_paste_keys_follow_the_window_or_the_override(self, monkeypatch, capsys):
         calls = self._patch(monkeypatch)
         monkeypatch.setattr(cli.windows, "active_window",
@@ -241,11 +304,13 @@ class TestArgvAndStdout:
         monkeypatch.setattr(sys, "getfilesystemencoding", lambda: "iso8859-1")
         assert cli.utf8_arg("año") == "año"  # b"a\xf1o" is not UTF-8: it really was Latin-1
 
+    @pytest.mark.skipif(os.name == "nt", reason="Windows argv is UTF-16, never Latin-1")
     def test_surrogate_escaped_bytes_are_decoded_as_utf8(self, monkeypatch):
         monkeypatch.setattr(sys, "getfilesystemencoding", lambda: "ascii")
         escaped = "niño".encode("utf-8").decode("ascii", "surrogateescape")
         assert cli.utf8_arg(escaped) == "niño"
 
+    @pytest.mark.skipif(os.name == "nt", reason="Windows argv is UTF-16, never Latin-1")
     def test_main_repairs_argv_before_parsing(self, monkeypatch, capsys):
         typed = []
         monkeypatch.setattr(cli.inp, "clipboard_available", lambda: True)
@@ -268,6 +333,7 @@ class TestArgvAndStdout:
         assert capsys.readouterr().out == SPANISH + "\n"
 
 
+@pytest.mark.skipif(os.name == "nt", reason="ydotool backend")
 def test_ydotool_gets_utf8_arguments_under_an_ascii_locale(monkeypatch):
     monkeypatch.setattr(sys, "getfilesystemencoding", lambda: "ascii")
     with patch("control.input.subprocess.run", return_value=_completed(stdout="", stderr="")) as run:

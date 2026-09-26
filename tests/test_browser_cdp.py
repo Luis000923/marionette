@@ -520,7 +520,10 @@ class TestInputCli:
         monkeypatch.setattr(cli.inp, "read_clipboard", missing)
         assert _main(["--json", "clip", "get"], monkeypatch) == 1
         err = json.loads(capsys.readouterr().out)
-        assert err["type"] == "clipboard_error" and "wl-clipboard" in err["hint"]
+        assert err["type"] == "clipboard_error"
+        # The hint names whatever has to be installed on this platform: wl-clipboard
+        # on Wayland, nothing at all on Windows (the clipboard is the OS's own).
+        assert "wl-clipboard" in err["hint"] or "holding the clipboard" in err["hint"]
 
 
 def test_readme_documents_every_new_command():

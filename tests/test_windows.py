@@ -1,12 +1,20 @@
-"""Tests for windows.py, mocking subprocess.run so no real kdotool is invoked."""
+"""Tests for windows.py, mocking subprocess.run so no real kdotool is invoked.
+
+POSIX-only: every assertion here is about the kdotool/gdbus backend. The Windows
+backend (winapi.py, no subprocess at all) is covered by test_win_native.py.
+"""
 from __future__ import annotations
 
+import os
 import subprocess
 from unittest.mock import patch
 
 import pytest
 
 from control import windows
+
+pytestmark = pytest.mark.skipif(
+    os.name != "posix", reason="exercises the kdotool/gdbus backend (POSIX only)")
 
 
 def _completed(stdout: str = "", stderr: str = "", returncode: int = 0) -> subprocess.CompletedProcess:

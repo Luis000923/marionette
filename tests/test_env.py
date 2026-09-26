@@ -1,6 +1,10 @@
 """Tests for env.py, the minimal .env parser/loader."""
 from __future__ import annotations
 
+import os
+
+import pytest
+
 from control import env
 
 
@@ -51,7 +55,12 @@ class TestLoadEnv:
 
 
 class TestPermissions:
-    """S2: an .env readable by other users is flagged (or refused in strict mode)."""
+    """S2: an .env readable by other users is flagged (or refused in strict mode).
+
+    The mode bits are a POSIX notion; on Windows every file reports 0666 whatever
+    its ACLs are, so privacy there is decided by *where* the file lives (see
+    `env.permission_problem` and test_win_native.py).
+    """
 
     def _file(self, tmp_path, mode, text="SAFE_VAR=1\n"):
         path = tmp_path / ".env"
@@ -63,6 +72,7 @@ class TestPermissions:
         env.load_env(self._file(tmp_path, 0o600))
         assert capsys.readouterr().err == ""
 
+    @pytest.mark.skipif(os.name != "posix", reason="POSIX mode bits")
     def test_world_readable_file_warns_once(self, tmp_path, capsys):
         path = self._file(tmp_path, 0o644)
         env.load_env(path)
@@ -71,15 +81,13 @@ class TestPermissions:
         assert err.count("insecure env file") == 1
         assert "0644" in err and "chmod 600" in err
 
+    @pytest.mark.skipif(os.name != "posix", reason="POSIX mode bits")
     def test_group_readable_file_warns_too(self, tmp_path, capsys):
         env.load_env(self._file(tmp_path, 0o640))
         assert "0640" in capsys.readouterr().err
 
+    @pytest.mark.skipif(os.name != "posix", reason="POSIX mode bits")
     def test_strict_mode_refuses_to_load(self, tmp_path, monkeypatch):
-        import os
-
-        import pytest
-
         monkeypatch.setenv("CONTROL_ENV_STRICT", "1")
         monkeypatch.delenv("SAFE_VAR", raising=False)
         with pytest.raises(env.EnvPermissionError, match="0644"):
