@@ -58,3 +58,45 @@ def test_launch_browser_chromium_missing(monkeypatch):
     monkeypatch.setattr(browser, "find_chromium", lambda: None)
     with pytest.raises(browser.BrowserError):
         browser.launch_browser("chromium", 9444)
+
+
+def test_obscura_fetch_parses_title_and_builds_command(monkeypatch):
+    seen = {}
+
+    class R:
+        returncode = 0
+        stdout = "body text"
+        stderr = 'Fetching u...\nPage loaded: https://x.test/ - "Titulo"\n'
+
+    def fake_run(cmd, **kw):
+        seen["cmd"] = cmd
+        return R()
+
+    monkeypatch.setattr(browser.subprocess, "run", fake_run)
+    res = browser.obscura_fetch("https://x.test", "markdown", selector="main", exe="/o")
+    assert res == {"url": "https://x.test/", "title": "Titulo", "content": "body text"}
+    assert seen["cmd"][:2] == ["/o", "fetch"] and "--selector" in seen["cmd"]
+    assert "--allow-private-network" not in seen["cmd"]
+
+
+def test_obscura_fetch_missing_binary(monkeypatch):
+    monkeypatch.setattr(browser, "find_obscura", lambda: None)
+    with pytest.raises(browser.BrowserError):
+        browser.obscura_fetch("https://x.test")
+
+
+def test_find_obscura_honours_env(monkeypatch, tmp_path):
+    exe = tmp_path / "obscura"
+    exe.write_text("#!/bin/sh\n")
+    exe.chmod(0o755)
+    monkeypatch.setenv("CONTROL_OBSCURA", str(exe))
+    assert browser.find_obscura() == str(exe)
+
+
+def test_relaunch_requires_confirmation():
+    import argparse
+    from control import cli
+    args = argparse.Namespace(window_class="brave-browser", port=9222, yes=False, json=True)
+    with pytest.raises(cli.CliError) as e:
+        cli._cmd_browser_relaunch(args)
+    assert e.value.kind == "confirmation_required"

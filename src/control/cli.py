@@ -1190,6 +1190,48 @@ def _cmd_browser_brave(args: argparse.Namespace) -> Out:
 
 
 @command
+def _cmd_browser_fetch(args: argparse.Namespace) -> Out:
+    """Default reader. Obscura when present; otherwise headless Chromium (text only)."""
+    if browser_mod.find_obscura() is not None:
+        res = browser_mod.obscura_fetch(args.url, args.dump, args.selector, args.wait,
+                                        args.timeout, args.allow_private_network)
+        engine = "obscura"
+    elif args.dump == "text":
+        with Browser(headless=True) as b:
+            page = b.goto(browser_mod.resolve_url(args.url))
+            res = {"url": page.url, "title": page.title(), "content": page.inner_text("body")}
+        engine = "chromium"
+    else:
+        raise CliError("obscura not found (needed for html/markdown/links)",
+                       hint="run scripts/install_obscura.sh, or set CONTROL_OBSCURA=/path/to/obscura",
+                       kind="browser_error")
+    text, truncated = browser_mod.compact_text(res["content"], args.max_chars)
+    data = {"url": res["url"], "title": res["title"], "engine": engine, "dump": args.dump,
+            "content": text, "truncated": truncated}
+    return Out(data, text)
+
+
+@command
+def _cmd_browser_detect(args: argparse.Namespace) -> Out:
+    info = browser_mod.detect_browsers(tuple(args.port) if args.port else (browser_mod.DEFAULT_CDP_PORT,))
+    rows = [f"{b['class']}\t{b['windows']} window(s)" for b in info["open"]] or ["(no browser open)"]
+    rows += [f"cdp ports: {info['cdp_ports'] or 'none'}", f"obscura: {info['obscura'] or 'not found'}",
+             f"-> {info['recommendation']}"]
+    return Out(info, "\n".join(rows))
+
+
+@command
+def _cmd_browser_relaunch(args: argparse.Namespace) -> Out:
+    if not args.yes:
+        raise CliError(
+            f"this closes every {args.window_class!r} window and reopens it with a debug port; "
+            "unsaved page state is lost",
+            hint="re-run with --yes once the user agrees", kind="confirmation_required")
+    info = browser_mod.relaunch_with_cdp(args.window_class, args.port)
+    return Out(_ok("relaunch", **info), f"debug port {args.port} up; use: --cdp-port {args.port}")
+
+
+@command
 def _cmd_browser_launch(args: argparse.Namespace) -> Out:
     info = browser_mod.launch_browser(args.browser, args.port, args.profile, args.url)
     return Out(_ok("launch", browser=args.browser, **info),
@@ -1728,6 +1770,32 @@ def build_parser() -> argparse.ArgumentParser:
     b.add_argument("--port", type=int, default=browser_mod.DEFAULT_CDP_PORT)
     b.add_argument("--profile", default=None, metavar="DIR", help="user-data-dir for Brave")
     b.add_argument("--url", default=None, help="open this URL on start")
+
+    b = leaf(browser_sub, "fetch", _cmd_browser_fetch,
+             help="DEFAULT for simple reads: render a page headlessly with Obscura "
+                  "(github.com/h4ckf0r0day/obscura) and print text/markdown/links/html; "
+                  "no window, no Playwright",
+             epilog="Powered by Obscura, by h4ckf0r0day (Apache-2.0). See THIRD_PARTY.md.")
+    b.add_argument("url", help="URL, host, or AI site alias")
+    b.add_argument("--dump", choices=browser_mod.OBSCURA_DUMPS, default="text")
+    b.add_argument("--selector", default=None, metavar="CSS", help="only this part of the page")
+    b.add_argument("--wait", type=float, default=None, metavar="S", help="fixed settle time for JS pages")
+    b.add_argument("--timeout", type=float, default=30.0)
+    b.add_argument("--max-chars", type=int, default=browser_mod.SNAPSHOT_MAX_CHARS, metavar="N",
+                   help=f"truncate to N chars, 0 = no cap (default: {browser_mod.SNAPSHOT_MAX_CHARS})")
+    b.add_argument("--allow-private-network", action="store_true",
+                   help="allow localhost/LAN URLs (blocked by default)")
+
+    b = leaf(browser_sub, "detect", _cmd_browser_detect,
+             help="which browsers are already open, whether one has a debug port, and how to drive it")
+    b.add_argument("--port", type=int, action="append", help="CDP port to probe (repeatable; default 9222)")
+
+    b = leaf(browser_sub, "relaunch", _cmd_browser_relaunch,
+             help="restart an already-open Chromium/Brave with a debug port on its own profile "
+                  "so it can be driven at DOM level (needs --yes: closes its windows)")
+    b.add_argument("window_class", help="window class from `browser detect`, e.g. brave-browser")
+    b.add_argument("--port", type=int, default=browser_mod.DEFAULT_CDP_PORT)
+    b.add_argument("--yes", action="store_true", help="confirm closing and reopening the browser")
 
     b = leaf(browser_sub, "launch", _cmd_browser_launch,
              help="start a persistent browser (chromium = Playwright's bundled one, or brave) "

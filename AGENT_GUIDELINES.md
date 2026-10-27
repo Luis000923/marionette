@@ -74,3 +74,11 @@ Fewer tool round-trips, less repeated overhead per call.
 
 See also the "Token efficiency for agents driving this tool" section in
 [README.md](README.md) for the fuller narrative version of these same rules.
+
+## Browsing: pick the lightest tool
+
+1. Just reading a page: `control browser fetch URL` (Obscura, no window).
+2. Browser already open: `control browser detect`. With a debug port, use `--cdp-port`; without one,
+   drive it visually (`click --text`, `type`, `key`, `--window`). `browser relaunch --yes` restarts it
+   with CDP on its own profile: ask the user first, it closes their windows.
+3. Logins/forms in a fresh browser: `browser launch` + `--cdp-port`, or the `Browser` class.

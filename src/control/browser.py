@@ -449,6 +449,121 @@ def find_chromium() -> str | None:
     return None
 
 
+# --- Obscura: lightweight headless engine for simple page reads ---------------
+# https://github.com/h4ckf0r0day/obscura (Apache-2.0, by h4ckf0r0day). Used as the
+# default reader: no window, no Playwright, ~30 MB. See THIRD_PARTY.md.
+
+OBSCURA_DUMPS = ("text", "markdown", "links", "html")
+_OBSCURA_REPO = Path(__file__).resolve().parents[2] / "obscura"
+
+
+def find_obscura() -> str | None:
+    """CONTROL_OBSCURA, then PATH, ~/.local/bin, then the repo's own obscura/ build."""
+    cands = [os.environ.get("CONTROL_OBSCURA"), shutil.which("obscura"),
+             str(Path.home() / ".local/bin/obscura"),
+             str(_OBSCURA_REPO / "target/release/obscura")]
+    for cand in cands:
+        if cand and os.access(cand, os.X_OK) and Path(cand).is_file():
+            return cand
+    return None
+
+
+def obscura_fetch(url: str, dump: str = "text", selector: str | None = None,
+                  wait: float | None = None, timeout: float = 30.0,
+                  allow_private: bool = False, exe: str | None = None) -> dict:
+    """Render `url` (JS included) with Obscura and return {url, title, content}."""
+    exe = exe or find_obscura()
+    if exe is None:
+        raise BrowserError("obscura not found",
+                           hint="run scripts/install_obscura.sh, or set CONTROL_OBSCURA=/path/to/obscura")
+    if dump not in OBSCURA_DUMPS:
+        raise BrowserError(f"unknown dump {dump!r}", hint=f"use one of: {', '.join(OBSCURA_DUMPS)}")
+    cmd = [exe]
+    if allow_private:
+        cmd.append("--allow-private-network")
+    cmd += ["fetch", resolve_url(url), "--dump", dump, "--timeout", str(int(timeout))]
+    if selector:
+        cmd += ["--selector", selector]
+    if wait is not None:
+        cmd += ["--wait", str(wait)]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 15)
+    except subprocess.TimeoutExpired:
+        raise BrowserError(f"obscura timed out after {timeout:g}s", hint="raise --timeout") from None
+    if r.returncode != 0:
+        raise BrowserError((r.stderr.strip().splitlines() or ["obscura failed"])[-1],
+                           hint="private/loopback URLs need --allow-private-network")
+    m = re.search(r'Page loaded: (.*) - "(.*)"\s*$', r.stderr, re.M)
+    return {"url": m.group(1) if m else url, "title": m.group(2) if m else "",
+            "content": r.stdout}
+
+
+_BROWSER_CLASS = re.compile(r"brave|chrom|firefox|vivaldi|opera|edge|librewolf|zen", re.I)
+_PROFILE_DIRS = {"brave": "~/.config/BraveSoftware/Brave-Browser", "chromium": "~/.config/chromium",
+                 "google-chrome": "~/.config/google-chrome"}
+
+
+def detect_browsers(ports: tuple[int, ...] = (DEFAULT_CDP_PORT,)) -> dict:
+    """Browsers already open on this desktop and the best way to drive each."""
+    from . import windows
+
+    seen: dict[str, dict] = {}
+    for w in windows.list_windows():
+        if _BROWSER_CLASS.search(w.classname or ""):
+            seen.setdefault(w.classname, {"class": w.classname, "windows": 0, "titles": []})
+            seen[w.classname]["windows"] += 1
+            seen[w.classname]["titles"].append(w.title)
+    live = [p for p in ports if cdp_alive(p)]
+    if live:
+        how = f"attached: control browser --cdp-port {live[0]} dom|click|fill|eval ..."
+    elif seen:
+        how = ("no debug port: drive it visually now (control click --text / type / key --window), "
+               "or control browser relaunch --yes to restart it with CDP on its own profile")
+    else:
+        how = "no browser open: control browser fetch URL (Obscura) or control browser launch"
+    return {"open": list(seen.values()), "cdp_ports": live, "obscura": find_obscura(),
+            "recommendation": how}
+
+
+def relaunch_with_cdp(window_class: str, port: int = DEFAULT_CDP_PORT, wait: float = 20.0) -> dict:
+    """Close an already-open Chromium-family browser and start it again on its own
+    profile with a loopback debug port. Open tabs only come back if the browser is
+    set to restore its session; anything unsaved in a page is lost."""
+    from . import windows
+
+    if cdp_alive(port):
+        return {"port": port, "started": False}
+    ps = subprocess.run(["ps", "-eo", "comm=,args="], capture_output=True, text=True).stdout
+    comm = next((ln.split(None, 1) for ln in ps.splitlines()
+                 if ln.split(None, 1)[0] and window_class.lower().split(".")[0] in ln.split(None, 1)[0].lower()), None)
+    if not comm:
+        raise BrowserError(f"no running process for window class {window_class!r}")
+    exe = comm[1].split(" --", 1)[0].strip()
+    kind = "brave" if "brave" in exe.lower() else "chromium" if "chromium" in exe.lower() else "google-chrome"
+    prof = Path(os.path.expanduser(_PROFILE_DIRS[kind]))
+    for w in windows.list_windows(window_class):
+        windows.Window(id=w.id).close()
+    deadline = time.monotonic() + wait
+    while time.monotonic() < deadline and subprocess.run(
+            ["pgrep", "-f", f"^{re.escape(exe)}( |$)"], capture_output=True).returncode == 0:
+        time.sleep(0.5)
+    else:
+        if time.monotonic() >= deadline:
+            raise BrowserError(f"{window_class} did not close within {wait:g}s",
+                               hint="save your work and close it manually, then run: "
+                                    f"control browser launch --browser {kind if kind == 'brave' else 'chromium'} --profile {prof}")
+    args = [exe, f"--remote-debugging-port={port}", "--remote-debugging-address=127.0.0.1",
+            f"--user-data-dir={prof}", "--restore-last-session"]
+    subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL, start_new_session=True)
+    end = time.monotonic() + wait
+    while time.monotonic() < end:
+        if cdp_alive(port):
+            return {"port": port, "started": True, "profile": str(prof), "binary": exe}
+        time.sleep(0.3)
+    raise BrowserError(f"{kind} did not open debug port {port} within {wait:g}s")
+
+
 def cdp_alive(port: int, timeout: float = 1.0) -> bool:
     try:
         with urllib.request.urlopen(f"http://127.0.0.1:{port}/json/version", timeout=timeout):

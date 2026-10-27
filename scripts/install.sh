@@ -88,3 +88,6 @@ echo "before using any 'control win ...' commands."
 echo
 echo "Next: install the Playwright browser binaries as your normal user:"
 echo "  cd $(dirname "$0")/.. && uv sync && uv run playwright install chromium"
+echo
+echo "Optional (default engine for 'control browser fetch'; needs Rust/cargo, long build):"
+echo "  $(dirname "$0")/install_obscura.sh   # Obscura by h4ckf0r0day, see THIRD_PARTY.md"

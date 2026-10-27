@@ -240,6 +240,21 @@ Fields: `url`, `input`, `send`, `response`, `busy`, `login`, `login_hosts`,
 - Headless Chromium is more likely to hit bot checks (Cloudflare and similar),
   which is why the browser runs headed by default.
 
+## Simple reads: `browser fetch` (Obscura, the default)
+
+```bash
+control browser fetch https://example.com                 # rendered text, no window
+control browser fetch URL --dump markdown|links|html --selector "main"
+control browser detect                                    # browsers already open + how to drive them
+```
+
+`fetch` renders pages (JavaScript included) with [Obscura](https://github.com/h4ckf0r0day/obscura),
+an open-source Rust headless browser by **h4ckf0r0day** (Apache-2.0; see `THIRD_PARTY.md`).
+It is the default for anything that only needs to *read* a page. Install with
+`scripts/install_obscura.sh` (or set `CONTROL_OBSCURA`); without it, `--dump text` falls
+back to headless Chromium. Use the browser commands below when a task needs logins,
+clicks or your already-open browser.
+
 ## Controlling a browser you already have open
 
 `control browser` normally launches its own Chromium with a persistent, isolated
