@@ -100,3 +100,17 @@ def test_relaunch_requires_confirmation():
     with pytest.raises(cli.CliError) as e:
         cli._cmd_browser_relaunch(args)
     assert e.value.kind == "confirmation_required"
+
+
+def test_relaunch_finds_process_by_window_class(monkeypatch):
+    class PS:
+        stdout = ("zsh /usr/bin/zsh -l\n"
+                  "brave /opt/brave-bin/brave --disable-features=X\n"
+                  "brave /opt/brave-bin/brave --type=renderer --foo\n")
+
+    monkeypatch.setattr(browser, "cdp_alive", lambda *a, **k: False)
+    monkeypatch.setattr(browser.subprocess, "run", lambda *a, **k: PS())
+    from control import windows
+    monkeypatch.setattr(windows, "list_windows", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("stop")))
+    with pytest.raises(RuntimeError, match="stop"):
+        browser.relaunch_with_cdp("brave-browser")

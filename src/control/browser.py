@@ -534,8 +534,16 @@ def relaunch_with_cdp(window_class: str, port: int = DEFAULT_CDP_PORT, wait: flo
     if cdp_alive(port):
         return {"port": port, "started": False}
     ps = subprocess.run(["ps", "-eo", "comm=,args="], capture_output=True, text=True).stdout
-    comm = next((ln.split(None, 1) for ln in ps.splitlines()
-                 if ln.split(None, 1)[0] and window_class.lower().split(".")[0] in ln.split(None, 1)[0].lower()), None)
+    cls = window_class.lower()
+    comm = None
+    for ln in ps.splitlines():
+        parts = ln.split(None, 1)
+        if len(parts) == 2 and parts[0].lower() != "ps" and (
+                parts[0].lower() in cls or cls.split(".")[0] in parts[0].lower()):
+            # main process only: renderer/utility children carry --type=
+            if " --type=" not in parts[1]:
+                comm = parts
+                break
     if not comm:
         raise BrowserError(f"no running process for window class {window_class!r}")
     exe = comm[1].split(" --", 1)[0].strip()
