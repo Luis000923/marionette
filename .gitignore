@@ -17,3 +17,10 @@ wheels/
 
 # Local secrets
 .env
+
+# Browser profiles / captures from local checks
+adminchk_tmp/
+flowcheck_prof/
+shot/
+*_prof/
+*_tmp/

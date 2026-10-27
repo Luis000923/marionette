@@ -465,7 +465,7 @@ class TestAttachCommand:
     def test_unreachable_port_reports_a_clear_error(self, monkeypatch, capsys):
         def make(port=browser.DEFAULT_CDP_PORT, headless=False):
             raise browser.BrowserError(
-                f"cannot reach a Chromium debug port at localhost:{port}",
+                f"cannot reach a Chromium debug port at 127.0.0.1:{port}",
                 hint="open the browser with --remote-debugging-port=9222 first",
             )
 
@@ -561,7 +561,7 @@ class TestCdpAttach:
         starter = self._starter(FakeCdpBrowser())
         with patch("control.browser.sync_playwright", return_value=starter):
             b = browser.Browser(cdp_port=9222)
-        assert starter.instance.chromium.url == "http://localhost:9222"
+        assert starter.instance.chromium.url == "http://127.0.0.1:9222"
         assert b.cdp_port == 9222
         assert b.profile is None
         assert b.active_tab() is page
@@ -637,7 +637,7 @@ class TestCdpAttach:
         starter = self._starter(FakeCdpBrowser())
         with patch("control.browser.sync_playwright", return_value=starter):
             b = browser.Browser.attach()
-        assert starter.instance.chromium.url == f"http://localhost:{browser.DEFAULT_CDP_PORT}"
+        assert starter.instance.chromium.url == f"http://127.0.0.1:{browser.DEFAULT_CDP_PORT}"
         assert b.cdp_port == browser.DEFAULT_CDP_PORT
 
 

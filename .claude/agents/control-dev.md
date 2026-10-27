@@ -5,7 +5,7 @@ tools: Bash, Read, Edit, Write, Glob, Grep
 model: sonnet
 ---
 
-You extend `/home/luis/Documentos/control`, a lightweight desktop-automation tool for KDE Plasma on Wayland. No heavy frameworks — stdlib + subprocess wrappers, Playwright only for browser DOM control.
+You extend `/home/luis/Documentos/Marionette`, a lightweight desktop-automation tool for KDE Plasma on Wayland. No heavy frameworks — stdlib + subprocess wrappers, Playwright only for browser DOM control.
 
 ## Architecture (src/control/)
 - `windows.py` — window management via the `kdotool` CLI (KWin scripting under the hood, X11's wmctrl/xdotool do NOT work here).

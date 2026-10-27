@@ -24,10 +24,11 @@ keep that cost down without losing verification quality:
 1. **Skip `uv run`'s resolve step once the venv is synced.** `uv run control ...`
    re-checks (and sometimes reinstalls) the local package on every invocation,
    printing noise like `Building marionette... Uninstalled... Installed...`
-   before the real output. Call the synced venv's binary directly instead:
+   before the real output. Just call `control` instead — it is symlinked onto the
+   PATH at `~/.local/bin/control`, so it resolves from any working directory:
 
    ```
-   /home/luis/Documentos/control/.venv/bin/control win list --json
+   control win list --json
    ```
 
    Same output, none of the resolver chatter. Re-run `uv sync` (or fall back to
@@ -246,6 +247,12 @@ profile. Sometimes you want the opposite: drive the Brave/Chrome/Chromium window
 the *user* already has open, with their real logins and tabs.
 
 ### Chromium/Brave: Chrome DevTools Protocol (precise, DOM-level)
+
+Fastest path for Brave: `control browser brave` starts it with a loopback-only debug
+port and a dedicated profile (Chromium 136+ ignores the debug port on the default
+profile), or reuses one already up. Then `export CONTROL_CDP_PORT=9222` so every
+`control browser ...` attaches without repeating `--cdp-port`. `browser snapshot`
+caps output at 6000 chars (`--max-chars N`, `0` = all) and `--json` keeps real UTF-8.
 
 Start the browser with a debug port open (do this once, before running any
 `control browser` command against it):
@@ -484,6 +491,37 @@ control key ctrl shift t
 control key Control Return          # same as: control key ctrl enter
 control key --list --json
 ```
+
+## Reading the screen without image tokens
+
+`shot` can post-process locally, so the agent rarely needs to look at a picture:
+
+```bash
+control shot window --window Firefox --ocr --grep "login|sign in"   # 'x,y,w,h text' lines
+control shot full --crop 0,0,400,300 --scale 0.5                    # smaller image if you must look
+control click -x 640 -y 400 --then-shot Firefox --ocr               # act + read the result
+```
+
+OCR coordinates are screen coordinates, ready for `click`. It uses `tesseract`
+with `spa+eng` data from `$CONTROL_TESSDATA` or `~/.local/share/marionette/tessdata`.
+When the agent cursor is visible, `click` and `drag` glide it to the target.
+
+## Agent cursor (Marionette's own pointer)
+
+Wayland has one real pointer, so a second one is impossible. `control cursor`
+gives the agent a visible, click-through overlay arrow instead; the user's
+pointer is only borrowed for the instant of a click and then put back.
+
+```bash
+control cursor show            # start the overlay (needs PySide6 in /usr/bin/python3,
+                               # or set CONTROL_CURSOR_PYTHON)
+control cursor move 800 400    # glide there (--duration 0 to jump)
+control cursor click           # click where the arrow is; -x/-y moves first
+control cursor status --json   # {"visible":..,"x":..,"y":..}
+control cursor hide
+```
+
+`--no-restore` on `click` leaves the real pointer on the target.
 
 ## Native desktop apps (AT-SPI)
 

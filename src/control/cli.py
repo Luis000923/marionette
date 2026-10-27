@@ -24,14 +24,16 @@ import difflib
 import functools
 import json
 import os
+import re
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
 from playwright.sync_api import Error as PlaywrightError
 
-from . import apps, atspi, env, input as inp, screenshot, session as session_mod, windows
+from . import apps, atspi, cursor as cursor_mod, env, input as inp, screenshot, session as session_mod, windows
 from . import browser as browser_mod
 from .browser import Browser
 from .env import load_env
@@ -139,7 +141,7 @@ def command(fn: Callable[[argparse.Namespace], Out | None]) -> Callable[[argpars
         if out is None:
             return
         if _json_mode(args):
-            print(json.dumps(out.data, indent=2 if getattr(args, "pretty", False) else None))
+            print(json.dumps(out.data, ensure_ascii=False, indent=2 if getattr(args, "pretty", False) else None, separators=None if getattr(args, "pretty", False) else (",", ":")))
         elif out.text:
             print(out.text)
 
@@ -317,23 +319,74 @@ def _cmd_win_wait_settled(args: argparse.Namespace) -> Out:
 
 # --- screenshots ---------------------------------------------------------------
 
-@command
-def _cmd_shot(args: argparse.Namespace) -> Out:
-    fn = {"full": screenshot.fullscreen, "window": screenshot.active_window,
-          "region": screenshot.region}[args.mode]
-    data: dict[str, Any] = {"mode": args.mode}
-    if args.window:
+def _box(value: str) -> tuple[int, int, int, int]:
+    try:
+        x, y, w, h = (int(v) for v in value.split(","))
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected X,Y,W,H (e.g. 0,0,400,300), got {value!r}") from None
+    return x, y, w, h
+
+
+def _shoot(args: argparse.Namespace, window: windows.Window | None = None) -> dict:
+    """Capture, then crop/shrink/OCR locally. Returns the fields for the output."""
+    mode = getattr(args, "mode", "full")
+    crop_arg = getattr(args, "crop", None)
+    if mode == "region" and crop_arg:
+        # An explicit box needs no interactive selection: grab the screen and crop.
+        mode_fn = screenshot.fullscreen
+    else:
+        mode_fn = {"full": screenshot.fullscreen, "window": screenshot.active_window,
+                   "region": screenshot.region}[mode]
+    fn = mode_fn
+    data: dict[str, Any] = {"mode": mode}
+    origin = (0, 0)
+    if window is not None or getattr(args, "window", None):
         # "window" mode captures whatever is focused, so focus + capture must
         # not be split by another agent's activation.
         with inp.input_lock():
-            win = _find_window(args.window, args)
+            win = window or _find_window(args.window, args)
             win.focus()
             path = fn()
+            g = win.geometry()
         data["window"] = win.to_dict()
+        if mode == "window":
+            origin = (g.get("x", 0), g.get("y", 0))
+            try:
+                screenshot.trim_window_shadow(path, g.get("width", 0), g.get("height", 0))
+            except OSError:
+                pass  # keep the untrimmed capture
     else:
         path = fn()
+    crop = getattr(args, "crop", None)
+    if crop:
+        origin = (origin[0] + crop[0], origin[1] + crop[1])
+    scale = getattr(args, "scale", 1.0)
+    try:
+        if getattr(args, "ocr", False):
+            src = screenshot.crop_scale(path, crop) if crop else path
+            lines = screenshot.ocr(src, origin)
+            pat = getattr(args, "grep", None)
+            if pat:
+                rx = re.compile(pat, re.I)
+                lines = [ln for ln in lines if rx.search(ln["text"])]
+            data["lines"] = lines
+        if crop or scale != 1.0:
+            path = screenshot.crop_scale(path, crop, scale)
+    except screenshot.ScreenshotError as e:
+        raise CliError(str(e), kind="ocr_error") from e
     data["path"] = str(path)
-    return Out(data, str(path))
+    return data
+
+
+def _shot_text(data: dict) -> str:
+    rows = [f"{ln['x']},{ln['y']},{ln['w']},{ln['h']} {ln['text']}" for ln in data.get("lines", [])]
+    return "\n".join([data["path"], *rows])
+
+
+@command
+def _cmd_shot(args: argparse.Namespace) -> Out:
+    data = _shoot(args)
+    return Out(data, _shot_text(data))
 
 
 # --- apps --------------------------------------------------------------------
@@ -365,12 +418,81 @@ def _cmd_apps_launch(args: argparse.Namespace) -> Out:
     return Out(_ok("launch", app_id=args.app_id, window=win.to_dict()), _win_line(win))
 
 
+# --- agent cursor ------------------------------------------------------------
+
+def _cursor_call(fn: Callable[..., dict], *a: Any, **kw: Any) -> dict:
+    try:
+        return fn(*a, **kw)
+    except (cursor_mod.CursorError, inp.YdotoolError) as e:
+        raise CliError(str(e), kind="cursor_error") from e
+
+
+def _cursor_out(action: str, data: dict) -> Out:
+    where = f" at {data['x']},{data['y']}" if data.get("visible") else ""
+    return Out(_ok(action, **data), f"cursor {'visible' if data['visible'] else 'hidden'}{where}")
+
+
+@command
+def _cmd_cursor_show(args: argparse.Namespace) -> Out:
+    return _cursor_out("cursor_show", _cursor_call(cursor_mod.show, args.color))
+
+
+@command
+def _cmd_cursor_hide(args: argparse.Namespace) -> Out:
+    return _cursor_out("cursor_hide", _cursor_call(cursor_mod.hide))
+
+
+@command
+def _cmd_cursor_status(args: argparse.Namespace) -> Out:
+    return _cursor_out("cursor_status", cursor_mod.status())
+
+
+@command
+def _cmd_cursor_move(args: argparse.Namespace) -> Out:
+    return _cursor_out("cursor_move", _cursor_call(cursor_mod.move, args.x, args.y, args.duration))
+
+
+@command
+def _cmd_cursor_click(args: argparse.Namespace) -> Out:
+    data = _cursor_call(cursor_mod.click, args.button, args.x, args.y,
+                        restore=not args.no_restore, duration=args.duration)
+    return _cursor_out("cursor_click", data)
+
+
 # --- input -------------------------------------------------------------------
+
+def _cursor_follow(x: int | None, y: int | None) -> None:
+    """If the agent cursor is on screen, glide it to (x, y) so the user sees where we act."""
+    if x is None or y is None or not cursor_mod.status()["visible"]:
+        return
+    try:
+        cursor_mod.move(x, y)
+    except cursor_mod.CursorError:
+        pass  # decoration only: never fail the real click over it
+
+
+def _then_shot(args: argparse.Namespace, out: Out) -> Out:
+    """--then-shot: capture the result of an action in the same call."""
+    target = getattr(args, "then_shot", None)
+    if not target:
+        return out
+    time.sleep(0.4)
+    ns = argparse.Namespace(mode="full" if target == "full" else "window",
+                            window=None if target == "full" else target,
+                            desktop=getattr(args, "desktop", None), crop=args.crop, scale=args.scale,
+                            ocr=args.ocr, grep=args.grep)
+    shot = _shoot(ns)
+    out.data["shot"] = shot
+    out.text = (out.text or "") + "\n" + _shot_text(shot)
+    return out
+
 
 @command
 def _cmd_click(args: argparse.Namespace) -> Out:
-    return _focused_input(args, "click", lambda: inp.click(args.button, args.x, args.y),
-                          button=args.button, x=args.x, y=args.y)
+    _cursor_follow(args.x, args.y)
+    out = _focused_input(args, "click", lambda: inp.click(args.button, args.x, args.y),
+                         button=args.button, x=args.x, y=args.y)
+    return _then_shot(args, out)
 
 
 def _paste_keys(args: argparse.Namespace) -> tuple[str, ...]:
@@ -450,11 +572,14 @@ def _point(value: str) -> tuple[int, int]:
 @command
 def _cmd_drag(args: argparse.Namespace) -> Out:
     (x1, y1), (x2, y2) = args.start, args.end
-    return _focused_input(
+    _cursor_follow(x1, y1)
+    out = _focused_input(
         args, "drag",
         lambda: inp.drag(x1, y1, x2, y2, args.button, steps=args.steps, hold_ms=args.hold),
         start=[x1, y1], end=[x2, y2], button=args.button, steps=args.steps,
     )
+    _cursor_follow(x2, y2)
+    return _then_shot(args, out)
 
 
 @command
@@ -704,6 +829,10 @@ def _cmd_desktop_switch(args: argparse.Namespace) -> Out:
 
 @command
 def _cmd_session_init(args: argparse.Namespace) -> Out:
+    args.name = args.name or session_mod.current_name()
+    if not args.name:
+        raise CliError("session name required", hint="pass --name NAME or --session NAME",
+                       kind="usage_error")
     session = session_mod.init(
         args.name, desktop=args.desktop, desktop_name=args.desktop_name,
         activate=args.activate,
@@ -874,9 +1003,13 @@ def browser_eval(browser: Browser, expression: str) -> dict:
     return {"result": _page(browser).evaluate(expression)}
 
 
-def browser_snapshot(browser: Browser) -> dict:
+def browser_snapshot(browser: Browser, max_chars: int | None = browser_mod.SNAPSHOT_MAX_CHARS) -> dict:
     page = _page(browser)
-    return {"url": page.url, "text": page.inner_text("body")}
+    text, truncated = browser_mod.compact_text(page.inner_text("body"), max_chars)
+    data = {"url": page.url, "text": text}
+    if truncated:
+        data["truncated"] = True
+    return data
 
 
 def browser_ask(browser: Browser, site: str, question: str, timeout: float,
@@ -895,6 +1028,11 @@ def _ask_text(data: dict) -> str:
         print("[WARN] the answer was still changing when --timeout hit; it may be cut off",
               file=sys.stderr)
     return data["response"]
+
+
+def _env_int(name: str) -> int | None:
+    raw = os.environ.get(name, "")
+    return int(raw) if raw.isdigit() else None
 
 
 def _read_question(args: argparse.Namespace) -> str:
@@ -940,7 +1078,7 @@ def _browser_command(run: Callable[[Browser, argparse.Namespace], dict],
 
 def _eval_text(data: dict) -> str:
     result = data["result"]
-    return result if isinstance(result, str) else json.dumps(result)
+    return result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)
 
 
 _cmd_browser_goto = _browser_command(
@@ -973,7 +1111,8 @@ _cmd_browser_drop = _browser_command(
 _cmd_browser_fill = _browser_command(lambda b, a: browser_fill(b, a.selector, a.text),
                                      lambda d: f"filled {d['selector']!r}")
 _cmd_browser_eval = _browser_command(lambda b, a: browser_eval(b, a.expression), _eval_text)
-_cmd_browser_snapshot = _browser_command(lambda b, a: browser_snapshot(b), lambda d: d["text"])
+_cmd_browser_snapshot = _browser_command(
+    lambda b, a: browser_snapshot(b, a.max_chars), lambda d: d["text"])
 _cmd_browser_ask = _browser_command(
     lambda b, a: browser_ask(b, a.site, _read_question(a), a.timeout, a.settle, a.continue_thread),
     _ask_text,
@@ -987,6 +1126,14 @@ _cmd_browser_login = _browser_command(
     headless=False,
     validate=lambda a: browser_mod.get_site(a.site),
 )
+
+
+@command
+def _cmd_browser_brave(args: argparse.Namespace) -> Out:
+    info = browser_mod.launch_brave(args.port, args.profile, args.url)
+    data = _ok("brave", **info)
+    return Out(data, f"Brave debug port {args.port} " + ("started" if info["started"] else "already up")
+               + f"; use: --cdp-port {args.port}")
 
 
 @command
@@ -1080,6 +1227,17 @@ def build_parser() -> argparse.ArgumentParser:
                  "desktops when there is none",
         )
 
+    def add_shot_options(parser: argparse.ArgumentParser) -> None:
+        parser.add_argument("--crop", type=_box, default=None, metavar="X,Y,W,H",
+                            help="keep only this pixel box of the capture")
+        parser.add_argument("--scale", type=float, default=1.0,
+                            help="shrink the image (e.g. 0.5): fewer image tokens if you must look")
+        parser.add_argument("--ocr", action="store_true",
+                            help="read the text locally (tesseract) and print 'x,y,w,h text' per "
+                                 "line in screen coordinates, so no image needs to be viewed")
+        parser.add_argument("--grep", default=None, metavar="REGEX",
+                            help="with --ocr, keep only lines matching REGEX")
+
     def add_window_option(parser: argparse.ArgumentParser) -> None:
         parser.add_argument(
             "--window", default=None, metavar="PATTERN",
@@ -1140,6 +1298,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     shot = leaf(sub, "shot", _cmd_shot, help="take a screenshot")
     shot.add_argument("mode", choices=["full", "window", "region"], default="full", nargs="?")
+    add_shot_options(shot)
     add_window_option(shot)
 
     app = sub.add_parser("app", help="find/launch applications")
@@ -1171,6 +1330,10 @@ def build_parser() -> argparse.ArgumentParser:
     click.add_argument("--button", default="left", choices=["left", "right", "middle"])
     click.add_argument("-x", type=int, default=None)
     click.add_argument("-y", type=int, default=None)
+    click.add_argument("--then-shot", default=None, metavar="PATTERN|full",
+                       help="after the click, capture that window (or 'full') in the same call; "
+                            "combine with --ocr/--scale/--crop/--grep")
+    add_shot_options(click)
     add_window_option(click)
 
     typ = leaf(sub, "type", _cmd_type)
@@ -1212,6 +1375,9 @@ def build_parser() -> argparse.ArgumentParser:
                 help="press, glide and release the mouse (e.g. drag a file from Dolphin "
                      "onto a web page); the button is always released, even on errors")
     drag.add_argument("--from", dest="start", type=_point, required=True, metavar="X,Y")
+    drag.add_argument("--then-shot", default=None, metavar="PATTERN|full",
+                      help="after the drag, capture that window (or 'full')")
+    add_shot_options(drag)
     drag.add_argument("--to", dest="end", type=_point, required=True, metavar="X,Y")
     drag.add_argument("--button", default="left", choices=["left", "right", "middle"])
     drag.add_argument("--steps", type=int, default=inp.DEFAULT_DRAG_STEPS,
@@ -1221,6 +1387,30 @@ def build_parser() -> argparse.ArgumentParser:
                       help="pause after pressing and before releasing "
                            f"(default: {inp.DEFAULT_DRAG_HOLD_MS})")
     add_window_option(drag)
+
+    cur = sub.add_parser(
+        "cursor",
+        help="Marionette's own on-screen pointer (an overlay arrow the agent moves; "
+             "the user's real pointer is only borrowed for clicks)")
+    cur_sub = cur.add_subparsers(dest="cursor_command", required=True)
+    c = leaf(cur_sub, "show", _cmd_cursor_show, help="show the agent cursor")
+    c.add_argument("--color", default="#d97757", help="arrow color (default: %(default)s)")
+    leaf(cur_sub, "hide", _cmd_cursor_hide, help="remove the agent cursor")
+    leaf(cur_sub, "status", _cmd_cursor_status, help="is it visible, and where")
+    c = leaf(cur_sub, "move", _cmd_cursor_move, help="glide the agent cursor to X Y")
+    c.add_argument("x", type=int)
+    c.add_argument("y", type=int)
+    c.add_argument("--duration", type=float, default=cursor_mod.DEFAULT_MOVE_SECONDS,
+                   help="glide time in seconds, 0 to jump (default: %(default)s)")
+    c = leaf(cur_sub, "click", _cmd_cursor_click,
+             help="click at the agent cursor (or at -x/-y after moving there); the real "
+                  "pointer returns to where the user left it")
+    c.add_argument("--button", default="left", choices=["left", "right", "middle"])
+    c.add_argument("-x", type=int, default=None)
+    c.add_argument("-y", type=int, default=None)
+    c.add_argument("--duration", type=float, default=cursor_mod.DEFAULT_MOVE_SECONDS)
+    c.add_argument("--no-restore", action="store_true",
+                   help="leave the real pointer on the click target")
 
     clip = sub.add_parser("clip", help="Wayland clipboard (wl-copy/wl-paste)")
     clip_sub = clip.add_subparsers(dest="clip_command", required=True)
@@ -1240,7 +1430,8 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--mime", default=None, help="ask for this MIME type (e.g. text/uri-list)")
 
     desktop = sub.add_parser("desktop", help="KDE virtual desktops (create/remove/switch)")
-    desktop_sub = desktop.add_subparsers(dest="desktop_command", required=True)
+    desktop_sub = desktop.add_subparsers(dest="desktop_command")
+    desktop.set_defaults(func=_cmd_desktop_list)  # bare `desktop` lists
 
     leaf(desktop_sub, "list", _cmd_desktop_list)
 
@@ -1276,7 +1467,8 @@ def build_parser() -> argparse.ArgumentParser:
     sess_sub = sess.add_subparsers(dest="session_command", required=True)
 
     sc = leaf(sess_sub, "init", _cmd_session_init, help="prepare (or re-attach to) an agent workspace")
-    sc.add_argument("--name", required=True)
+    sc.add_argument("--name", default=None,
+                    help="session name (default: the global --session / CONTROL_SESSION_ID)")
     sc.add_argument("--desktop", default=None, metavar="N|NAME",
                     help="pin to this desktop (number, or name -- created if missing) "
                          "instead of creating control:<name>")
@@ -1372,7 +1564,7 @@ def build_parser() -> argparse.ArgumentParser:
     browser = sub.add_parser("browser", help="DOM-precise browser control (Playwright/Chromium)")
     browser.add_argument("--headless", action="store_true", help="run Chromium headless")
     browser.add_argument(
-        "--cdp-port", type=int, default=None, metavar="PORT",
+        "--cdp-port", type=int, default=_env_int("CONTROL_CDP_PORT"), metavar="PORT",
         help="drive a Chromium/Brave already running (started with "
              "--remote-debugging-port=PORT) instead of launching one; commands then "
              "act on the tab in front, and focus-and-goto can --wait-loaded",
@@ -1458,7 +1650,17 @@ def build_parser() -> argparse.ArgumentParser:
     b = leaf(browser_sub, "eval", _cmd_browser_eval, help="evaluate a JS expression on the active page")
     b.add_argument("expression")
 
-    leaf(browser_sub, "snapshot", _cmd_browser_snapshot, help="dump the visible text of the active page")
+    b = leaf(browser_sub, "snapshot", _cmd_browser_snapshot,
+             help="dump the visible text of the active page (capped, blank lines collapsed)")
+    b.add_argument("--max-chars", type=int, default=browser_mod.SNAPSHOT_MAX_CHARS, metavar="N",
+                   help=f"truncate to N chars, 0 = no cap (default: {browser_mod.SNAPSHOT_MAX_CHARS})")
+
+    b = leaf(browser_sub, "brave", _cmd_browser_brave,
+             help="start Brave with a loopback debug port (dedicated profile) if not already "
+                  "reachable; afterwards use --cdp-port or CONTROL_CDP_PORT")
+    b.add_argument("--port", type=int, default=browser_mod.DEFAULT_CDP_PORT)
+    b.add_argument("--profile", default=None, metavar="DIR", help="user-data-dir for Brave")
+    b.add_argument("--url", default=None, help="open this URL on start")
 
     b = leaf(browser_sub, "attach", _cmd_browser_attach,
              help="connect to a Chromium already running with --remote-debugging-port "

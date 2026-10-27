@@ -419,3 +419,26 @@ def test_geometry_parses_kdotool_output():
     with patch("control.windows.subprocess.run", return_value=_completed(stdout=out)):
         geo = windows.Window("{96a3}").geometry()
     assert geo == {"x": 332, "y": -14, "width": 1256, "height": 809}
+
+
+class TestDesktopReporting:
+    def test_search_async_reports_each_windows_real_desktop(self):
+        import asyncio
+
+        async def fake_run(*args: str) -> str:
+            if args[0] == "search":
+                return "111\n222\n"
+            if args[0] == "get_desktop_for_window":
+                return "3" if args[1] == "111" else "null"
+            return "x"
+
+        with patch("control.windows._run_async", side_effect=fake_run):
+            results = asyncio.run(windows.search_async(""))
+        assert [w.desktop for w in results] == [3, None]
+
+    def test_active_window_reports_desktop(self):
+        def fake_run(*args: str) -> str:
+            return {"getactivewindow": "42", "get_desktop_for_window": "2"}.get(args[0], "n")
+
+        with patch("control.windows._run", side_effect=fake_run):
+            assert windows.active_window().desktop == 2

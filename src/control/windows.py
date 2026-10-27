@@ -186,7 +186,11 @@ def active_window() -> Window:
     win_id = _run("getactivewindow", "getwindowid")
     title = _run("getwindowname", win_id)
     classname = _run("getwindowclassname", win_id)
-    return Window(id=win_id, title=title, classname=classname)
+    try:
+        desktop = _parse_desktop_number(_run("get_desktop_for_window", win_id))
+    except KdotoolError:
+        desktop = None
+    return Window(id=win_id, title=title, classname=classname, desktop=desktop)
 
 
 def _search_args(pattern: str, limit: int = 0, desktop: int | None = None) -> list[str]:
@@ -249,7 +253,15 @@ async def search_async(pattern: str, limit: int = 0,
                 )
             except KdotoolError:
                 title, classname = "", ""
-        return Window(id=win_id, title=title, classname=classname, desktop=desktop)
+            win_desktop = desktop
+            if win_desktop is None:
+                # Unfiltered listing: report where each window really lives.
+                try:
+                    win_desktop = _parse_desktop_number(
+                        await _run_async("get_desktop_for_window", win_id))
+                except KdotoolError:
+                    win_desktop = None
+        return Window(id=win_id, title=title, classname=classname, desktop=win_desktop)
 
     return list(await asyncio.gather(*(describe(i) for i in ids)))
 

@@ -17,6 +17,9 @@ import base64
 import json
 import mimetypes
 import os
+import re
+import shutil
+import subprocess
 import time
 import urllib.request
 import uuid
@@ -246,6 +249,8 @@ def resolve_url(target: str) -> str:
 
 #: Default Chrome DevTools Protocol debug port (`--remote-debugging-port=9222`).
 DEFAULT_CDP_PORT = 9222
+#: Default cap for `browser snapshot` output, in characters (~1.5k tokens).
+SNAPSHOT_MAX_CHARS = 6000
 
 
 class Browser:
@@ -268,12 +273,12 @@ class Browser:
             self.profile = None
             try:
                 self._browser = self._playwright.chromium.connect_over_cdp(
-                    f"http://localhost:{cdp_port}"
+                    f"http://127.0.0.1:{cdp_port}"
                 )
             except Exception as exc:
                 self._playwright.stop()
                 raise BrowserError(
-                    f"cannot reach a Chromium debug port at localhost:{cdp_port}: {exc}",
+                    f"cannot reach a Chromium debug port at 127.0.0.1:{cdp_port}: {exc}",
                     hint=f"open the browser with --remote-debugging-port={cdp_port} "
                          "first (see README), or check the port number",
                 ) from exc
@@ -406,11 +411,70 @@ def cdp_targets(port: int, timeout: float = 2.0) -> list[dict]:
     unreachable endpoint just means "don't know" (empty list).
     """
     try:
-        with urllib.request.urlopen(f"http://localhost:{port}/json/list", timeout=timeout) as resp:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/json/list", timeout=timeout) as resp:
             data = json.load(resp)
     except (OSError, ValueError):
         return []
     return [t for t in data if isinstance(t, dict) and t.get("type") == "page"]
+
+
+#: Dedicated profile for the debuggable Brave. Chromium 136+ ignores
+#: `--remote-debugging-port` on the default profile, so a separate dir is required.
+BRAVE_PROFILE_DIR = Path.home() / ".local/share/control/brave-cdp-profile"
+_BRAVE_NAMES = ("brave", "brave-browser", "brave-browser-stable", "brave-bin")
+
+
+def find_brave() -> str | None:
+    """Path of the Brave binary, or None."""
+    for name in _BRAVE_NAMES:
+        found = shutil.which(name)
+        if found:
+            return found
+    return None
+
+
+def cdp_alive(port: int, timeout: float = 1.0) -> bool:
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/json/version", timeout=timeout):
+            return True
+    except (OSError, ValueError):
+        return False
+
+
+def launch_brave(port: int = DEFAULT_CDP_PORT, profile: Path | str | None = None,
+                 url: str | None = None, wait: float = 15.0) -> dict:
+    """Start Brave with a loopback-only debug port; no-op if the port already answers."""
+    if cdp_alive(port):
+        return {"port": port, "started": False}
+    exe = find_brave()
+    if exe is None:
+        raise BrowserError("Brave not found in PATH",
+                           hint="install it (e.g. yay -S brave-bin) or start any Chromium with "
+                                "--remote-debugging-port and use --cdp-port")
+    prof = Path(profile) if profile else BRAVE_PROFILE_DIR
+    prof.mkdir(parents=True, exist_ok=True, mode=0o700)
+    args = [exe, f"--remote-debugging-port={port}", "--remote-debugging-address=127.0.0.1",
+            f"--user-data-dir={prof}", "--no-first-run", "--no-default-browser-check"]
+    if url:
+        args.append(resolve_url(url))
+    subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL, start_new_session=True)
+    deadline = time.monotonic() + wait
+    while time.monotonic() < deadline:
+        if cdp_alive(port):
+            return {"port": port, "started": True, "profile": str(prof), "binary": exe}
+        time.sleep(0.25)
+    raise BrowserError(f"Brave did not open debug port {port} within {wait:g}s",
+                       hint="a Brave already using this profile blocks it; close it or pass --profile")
+
+
+def compact_text(text: str, max_chars: int | None) -> tuple[str, bool]:
+    """Collapse blank-line runs and trailing spaces; cap length. Returns (text, truncated)."""
+    text = re.sub(r"[ \t]+\n", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    if max_chars and len(text) > max_chars:
+        return text[:max_chars].rstrip() + f"\n[... truncated {len(text) - max_chars} chars; --max-chars 0 for all]", True
+    return text, False
 
 
 def _match_target(pages, targets: list[dict]):

@@ -10,15 +10,18 @@ rediscover them by burning tokens first.
 `uv run control ...` re-resolves the project and sometimes reinstalls the local
 package on every single invocation, printing resolver noise
 (`Building marionette... Uninstalled 1 package... Installed 1 package...`)
-before the command's actual output. Once `uv sync` has been run, call the
-synced binary directly:
+before the command's actual output. Once `uv sync` has been run, just call
+`control` — it is symlinked onto the PATH at `~/.local/bin/control`, so it works
+from any directory:
 
 ```bash
-/home/luis/Documentos/control/.venv/bin/control win list --json
+control win list --json
 ```
 
-Same output, zero resolver chatter. Only go back to `uv run` right after
-actually changing a dependency in `pyproject.toml`.
+Same output, zero resolver chatter. The underlying venv binary is
+`/home/luis/Documentos/Marionette/.venv/bin/control` if you ever need the
+absolute path. Only go back to `uv run` right after actually changing a
+dependency in `pyproject.toml`.
 
 ## 2. Prioritize text and JSON over screenshots
 
