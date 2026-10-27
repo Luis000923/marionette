@@ -35,3 +35,19 @@ def test_region_with_crop_is_not_interactive():
         cli._shoot(args)
     full.assert_called_once()
     reg.assert_not_called()
+
+
+def test_ocr_ready_inverts_dark_images(tmp_path):
+    path = tmp_path / "dark.png"
+    Image.new("RGBA", (20, 20), (10, 10, 10, 255)).save(path)
+    out, temp = screenshot._ocr_ready(path)
+    try:
+        assert temp is True and Image.open(out).getpixel((1, 1)) > 200
+    finally:
+        out.unlink()
+
+
+def test_ocr_ready_keeps_light_images(tmp_path):
+    path = tmp_path / "light.png"
+    Image.new("RGB", (20, 20), (240, 240, 240)).save(path)
+    assert screenshot._ocr_ready(path) == (path, False)

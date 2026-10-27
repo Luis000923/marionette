@@ -123,6 +123,27 @@ def crop_scale(path: Path, box: tuple[int, int, int, int] | None = None,
     return out
 
 
+def _ocr_ready(path: Path) -> tuple[Path, bool]:
+    """Grayscale copy for Tesseract, inverted when dark: it misses light-on-dark text.
+
+    Same size as the original, so coordinates stay valid. (path, is_temporary).
+    """
+    from PIL import Image, ImageOps, ImageStat  # lazy
+
+    with Image.open(path) as im:
+        if im.mode in ("RGBA", "LA"):
+            flat = Image.new("RGB", im.size, (0, 0, 0))
+            flat.paste(im.convert("RGBA"), mask=im.getchannel("A"))
+            im = flat
+        gray = im.convert("L")
+    if ImageStat.Stat(gray).mean[0] >= 110:
+        return path, False
+    fd, tmp = tempfile.mkstemp(suffix=".png", prefix="ocr-")
+    os.close(fd)
+    ImageOps.invert(gray).save(tmp)
+    return Path(tmp), True
+
+
 def ocr(path: Path, origin: tuple[int, int] = (0, 0), lang: str = "spa+eng",
         min_conf: int = 30) -> list[dict]:
     """Text lines in `path` as {text, x, y, w, h, conf}, offset by `origin` so the
@@ -132,10 +153,17 @@ def ocr(path: Path, origin: tuple[int, int] = (0, 0), lang: str = "spa+eng",
     if data:
         env["TESSDATA_PREFIX"] = data
     try:
-        result = subprocess.run(["tesseract", str(path), "stdout", "-l", lang, "--psm", "11", "-c", "tessedit_create_tsv=1"],
+        src, temp = _ocr_ready(path)
+    except OSError:
+        src, temp = path, False
+    try:
+        result = subprocess.run(["tesseract", str(src), "stdout", "-l", lang, "--psm", "11", "-c", "tessedit_create_tsv=1"],
                                 capture_output=True, text=True, timeout=60, env=env)
     except FileNotFoundError:
         raise ScreenshotError("tesseract not found; install it for --ocr") from None
+    finally:
+        if temp:
+            src.unlink(missing_ok=True)
     if result.returncode != 0:
         raise ScreenshotError(result.stderr.strip() or "tesseract failed")
     lines: dict[tuple, dict] = {}

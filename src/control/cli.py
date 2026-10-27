@@ -362,7 +362,7 @@ def _shoot(args: argparse.Namespace, window: windows.Window | None = None) -> di
         origin = (origin[0] + crop[0], origin[1] + crop[1])
     scale = getattr(args, "scale", 1.0)
     try:
-        if getattr(args, "ocr", False):
+        if getattr(args, "ocr", False) or getattr(args, "grep", None):
             src = screenshot.crop_scale(path, crop) if crop else path
             lines = screenshot.ocr(src, origin)
             pat = getattr(args, "grep", None)
