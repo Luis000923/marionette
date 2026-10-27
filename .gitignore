@@ -24,3 +24,6 @@ flowcheck_prof/
 shot/
 *_prof/
 *_tmp/
+
+# Embedded local repo
+obscura/
