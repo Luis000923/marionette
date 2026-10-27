@@ -364,7 +364,7 @@ def _shoot(args: argparse.Namespace, window: windows.Window | None = None) -> di
     try:
         if getattr(args, "ocr", False) or getattr(args, "grep", None):
             src = screenshot.crop_scale(path, crop) if crop else path
-            lines = screenshot.ocr(src, origin)
+            lines = screenshot.ocr(src, origin, words=getattr(args, "ocr_words", False))
             pat = getattr(args, "grep", None)
             if pat:
                 rx = re.compile(pat, re.I)
@@ -487,11 +487,64 @@ def _then_shot(args: argparse.Namespace, out: Out) -> Out:
     return out
 
 
+def _locate_text(args: argparse.Namespace) -> dict:
+    """Find `--text` on screen (or in --window) by OCR; returns the match with its centre."""
+    ns = argparse.Namespace(**vars(args))
+    ns.mode = "window" if getattr(args, "window", None) else "full"
+    ns.crop, ns.scale, ns.ocr, ns.grep, ns.ocr_words = None, 1.0, True, args.text, True
+    try:
+        lines = _shoot(ns)["lines"]
+    except re.error as e:
+        raise CliError(f"bad --text regex: {e}", kind="usage_error") from e
+    # Reading order, so --nth means "the Nth one you would read".
+    lines.sort(key=lambda ln: (round(ln["y"] / 10), ln["x"]))
+    if len(lines) < args.nth:
+        found = [ln["text"] for ln in lines][:10]
+        raise CliError(
+            f"text {args.text!r} not found on screen"
+            + (f" (only {len(lines)} match(es), asked for #{args.nth})" if lines else ""),
+            hint="look at what OCR sees with: control shot --ocr" + (f"; matches: {found}" if found else ""),
+            kind="text_not_found",
+        )
+    ln = lines[args.nth - 1]
+    box = _match_box(ln, args.text)
+    return {"text": ln["text"], "x": box[0] + box[2] // 2, "y": box[1] + box[3] // 2}
+
+
+def _match_box(line: dict, pattern: str) -> tuple[int, int, int, int]:
+    """x, y, w, h of the words the regex matched (the whole line if that can't be told),
+    so a click lands on the target word, not the middle of a long line."""
+    whole = (line["x"], line["y"], line["w"], line["h"])
+    m = re.search(pattern, line["text"], re.I)
+    ws = line.get("words")
+    if not m or not ws or " ".join(w["text"] for w in ws) != line["text"]:
+        return whole
+    hit, pos = [], 0
+    for w in ws:
+        start, end = pos, pos + len(w["text"])
+        if start < m.end() and end > m.start():
+            hit.append(w)
+        pos = end + 1
+    if not hit:
+        return whole
+    x1, y1 = min(w["x"] for w in hit), min(w["y"] for w in hit)
+    x2, y2 = max(w["x"] + w["w"] for w in hit), max(w["y"] + w["h"] for w in hit)
+    return x1, y1, x2 - x1, y2 - y1
+
+
 @command
 def _cmd_click(args: argparse.Namespace) -> Out:
+    matched = None
+    if args.text:
+        if args.x is not None or args.y is not None:
+            raise CliError("use either --text or -x/-y, not both", kind="usage_error")
+        matched = _locate_text(args)
+        args.x, args.y = matched["x"], matched["y"]
     _cursor_follow(args.x, args.y)
     out = _focused_input(args, "click", lambda: inp.click(args.button, args.x, args.y),
                          button=args.button, x=args.x, y=args.y)
+    if matched:
+        out.data["matched"] = matched["text"]
     return _then_shot(args, out)
 
 
@@ -1137,6 +1190,15 @@ def _cmd_browser_brave(args: argparse.Namespace) -> Out:
 
 
 @command
+def _cmd_browser_launch(args: argparse.Namespace) -> Out:
+    info = browser_mod.launch_browser(args.browser, args.port, args.profile, args.url)
+    return Out(_ok("launch", browser=args.browser, **info),
+               f"{args.browser} debug port {args.port} "
+               + ("started" if info["started"] else "already up")
+               + f"; use: --cdp-port {args.port}")
+
+
+@command
 def _cmd_browser_attach(args: argparse.Namespace) -> Out:
     with Browser.attach(port=args.port) as b:
         tabs = [{"url": p.url, "title": p.title()} for p in b.pages]
@@ -1330,6 +1392,11 @@ def build_parser() -> argparse.ArgumentParser:
     click.add_argument("--button", default="left", choices=["left", "right", "middle"])
     click.add_argument("-x", type=int, default=None)
     click.add_argument("-y", type=int, default=None)
+    click.add_argument("--text", default=None, metavar="REGEX",
+                       help="click the centre of on-screen text found by OCR (case-insensitive "
+                            "regex) instead of -x/-y; searches --window if given, else the screen")
+    click.add_argument("--nth", type=int, default=1, metavar="N",
+                       help="with --text: pick the Nth match in reading order (default 1)")
     click.add_argument("--then-shot", default=None, metavar="PATTERN|full",
                        help="after the click, capture that window (or 'full') in the same call; "
                             "combine with --ocr/--scale/--crop/--grep")
@@ -1660,6 +1727,14 @@ def build_parser() -> argparse.ArgumentParser:
                   "reachable; afterwards use --cdp-port or CONTROL_CDP_PORT")
     b.add_argument("--port", type=int, default=browser_mod.DEFAULT_CDP_PORT)
     b.add_argument("--profile", default=None, metavar="DIR", help="user-data-dir for Brave")
+    b.add_argument("--url", default=None, help="open this URL on start")
+
+    b = leaf(browser_sub, "launch", _cmd_browser_launch,
+             help="start a persistent browser (chromium = Playwright's bundled one, or brave) "
+                  "with a loopback debug port; tabs survive between calls via --cdp-port")
+    b.add_argument("--browser", choices=["chromium", "brave"], default="chromium")
+    b.add_argument("--port", type=int, default=browser_mod.DEFAULT_CDP_PORT)
+    b.add_argument("--profile", default=None, metavar="DIR", help="user-data-dir")
     b.add_argument("--url", default=None, help="open this URL on start")
 
     b = leaf(browser_sub, "attach", _cmd_browser_attach,

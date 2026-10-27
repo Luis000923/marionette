@@ -145,7 +145,7 @@ def _ocr_ready(path: Path) -> tuple[Path, bool]:
 
 
 def ocr(path: Path, origin: tuple[int, int] = (0, 0), lang: str = "spa+eng",
-        min_conf: int = 30) -> list[dict]:
+        min_conf: int = 30, words: bool = False) -> list[dict]:
     """Text lines in `path` as {text, x, y, w, h, conf}, offset by `origin` so the
     coordinates are screen coordinates an agent can click directly."""
     env = dict(os.environ)
@@ -176,13 +176,20 @@ def ocr(path: Path, origin: tuple[int, int] = (0, 0), lang: str = "spa+eng",
         cur = lines.get(key)
         if cur is None:
             lines[key] = {"text": f[11].strip(), "x": x, "y": y, "x2": x + w, "y2": y + h,
-                          "conf": float(f[10]), "n": 1}
+                          "conf": float(f[10]), "n": 1, "words": [(f[11].strip(), x, y, w, h)]}
         else:
+            cur["words"].append((f[11].strip(), x, y, w, h))
             cur["text"] += " " + f[11].strip()
             cur["x2"], cur["y2"] = max(cur["x2"], x + w), max(cur["y2"], y + h)
             cur["y"] = min(cur["y"], y)
             cur["conf"] += float(f[10])
             cur["n"] += 1
-    return [{"text": c["text"], "x": c["x"] + origin[0], "y": c["y"] + origin[1],
-             "w": c["x2"] - c["x"], "h": c["y2"] - c["y"], "conf": round(c["conf"] / c["n"])}
-            for c in lines.values()]
+    out = []
+    for c in lines.values():
+        line = {"text": c["text"], "x": c["x"] + origin[0], "y": c["y"] + origin[1],
+                "w": c["x2"] - c["x"], "h": c["y2"] - c["y"], "conf": round(c["conf"] / c["n"])}
+        if words:
+            line["words"] = [{"text": t, "x": x + origin[0], "y": y + origin[1], "w": w, "h": h}
+                             for t, x, y, w, h in c["words"]]
+        out.append(line)
+    return out

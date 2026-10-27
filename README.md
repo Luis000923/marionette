@@ -248,6 +248,10 @@ the *user* already has open, with their real logins and tabs.
 
 ### Chromium/Brave: Chrome DevTools Protocol (precise, DOM-level)
 
+Persistent Chromium without Brave: `control browser launch [--browser chromium|brave]
+--port 9222` starts a detached browser (Playwright's bundled Chromium by default) so tabs
+survive between CLI calls; then use `control browser --cdp-port 9222 goto|fill|click|snapshot ...`.
+
 Fastest path for Brave: `control browser brave` starts it with a loopback-only debug
 port and a dedicated profile (Chromium 136+ ignores the debug port on the default
 profile), or reuses one already up. Then `export CONTROL_CDP_PORT=9222` so every
@@ -500,6 +504,7 @@ control key --list --json
 control shot window --window Firefox --ocr --grep "login|sign in"   # 'x,y,w,h text' lines
 control shot full --crop 0,0,400,300 --scale 0.5                    # smaller image if you must look
 control click -x 640 -y 400 --then-shot Firefox --ocr               # act + read the result
+control click --text "guardar|save" --window Firefox [--nth 2]       # click on-screen text found by OCR
 ```
 
 OCR coordinates are screen coordinates, ready for `click`. It uses `tesseract`

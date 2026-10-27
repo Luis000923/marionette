@@ -40,3 +40,21 @@ def test_launch_brave_uses_loopback_and_private_profile(monkeypatch, tmp_path):
     assert "--remote-debugging-port=9333" in args
     assert f"--user-data-dir={tmp_path / 'p'}" in args
     assert kw["start_new_session"] is True and info["started"] is True
+
+
+def test_launch_browser_chromium_uses_bundled_binary(monkeypatch, tmp_path):
+    calls = []
+    states = iter([False, True])
+    monkeypatch.setattr(browser, "cdp_alive", lambda port, timeout=1.0: next(states))
+    monkeypatch.setattr(browser, "find_chromium", lambda: "/pw/chrome")
+    monkeypatch.setattr(browser.subprocess, "Popen", lambda args, **kw: calls.append(args))
+    info = browser.launch_browser("chromium", 9444, tmp_path / "p")
+    assert calls[0][0] == "/pw/chrome" and "--remote-debugging-port=9444" in calls[0]
+    assert info["started"] is True
+
+
+def test_launch_browser_chromium_missing(monkeypatch):
+    monkeypatch.setattr(browser, "cdp_alive", lambda port, timeout=1.0: False)
+    monkeypatch.setattr(browser, "find_chromium", lambda: None)
+    with pytest.raises(browser.BrowserError):
+        browser.launch_browser("chromium", 9444)

@@ -433,6 +433,22 @@ def find_brave() -> str | None:
     return None
 
 
+CHROMIUM_PROFILE_DIR = Path.home() / ".local/share/control/chromium-cdp-profile"
+
+
+def find_chromium() -> str | None:
+    """Playwright's bundled Chromium (newest build), else a system Chromium/Chrome."""
+    root = Path(os.environ.get("PLAYWRIGHT_BROWSERS_PATH") or Path.home() / ".cache/ms-playwright")
+    builds = sorted(root.glob("chromium-*/chrome-linux*/chrome"), reverse=True)
+    if builds:
+        return str(builds[0])
+    for name in ("chromium", "chromium-browser", "google-chrome-stable", "google-chrome"):
+        found = shutil.which(name)
+        if found:
+            return found
+    return None
+
+
 def cdp_alive(port: int, timeout: float = 1.0) -> bool:
     try:
         with urllib.request.urlopen(f"http://127.0.0.1:{port}/json/version", timeout=timeout):
@@ -444,14 +460,25 @@ def cdp_alive(port: int, timeout: float = 1.0) -> bool:
 def launch_brave(port: int = DEFAULT_CDP_PORT, profile: Path | str | None = None,
                  url: str | None = None, wait: float = 15.0) -> dict:
     """Start Brave with a loopback-only debug port; no-op if the port already answers."""
+    return launch_browser("brave", port, profile, url, wait)
+
+
+def launch_browser(kind: str = "brave", port: int = DEFAULT_CDP_PORT,
+                   profile: Path | str | None = None, url: str | None = None,
+                   wait: float = 15.0) -> dict:
+    """Start Brave or Chromium detached with a loopback-only debug port, so a
+    browser (and its tabs) outlives each CLI call. No-op if the port answers."""
     if cdp_alive(port):
         return {"port": port, "started": False}
-    exe = find_brave()
+    if kind == "chromium":
+        exe, label, default_prof = find_chromium(), "Chromium", CHROMIUM_PROFILE_DIR
+    else:
+        exe, label, default_prof = find_brave(), "Brave", BRAVE_PROFILE_DIR
     if exe is None:
-        raise BrowserError("Brave not found in PATH",
+        raise BrowserError(f"{label} not found",
                            hint="install it (e.g. yay -S brave-bin) or start any Chromium with "
                                 "--remote-debugging-port and use --cdp-port")
-    prof = Path(profile) if profile else BRAVE_PROFILE_DIR
+    prof = Path(profile) if profile else default_prof
     prof.mkdir(parents=True, exist_ok=True, mode=0o700)
     args = [exe, f"--remote-debugging-port={port}", "--remote-debugging-address=127.0.0.1",
             f"--user-data-dir={prof}", "--no-first-run", "--no-default-browser-check"]
@@ -464,8 +491,8 @@ def launch_brave(port: int = DEFAULT_CDP_PORT, profile: Path | str | None = None
         if cdp_alive(port):
             return {"port": port, "started": True, "profile": str(prof), "binary": exe}
         time.sleep(0.25)
-    raise BrowserError(f"Brave did not open debug port {port} within {wait:g}s",
-                       hint="a Brave already using this profile blocks it; close it or pass --profile")
+    raise BrowserError(f"{label} did not open debug port {port} within {wait:g}s",
+                       hint="a browser already using this profile blocks it; close it or pass --profile")
 
 
 def compact_text(text: str, max_chars: int | None) -> tuple[str, bool]:
