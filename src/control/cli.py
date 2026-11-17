@@ -541,8 +541,17 @@ def _cmd_click(args: argparse.Namespace) -> Out:
         matched = _locate_text(args)
         args.x, args.y = matched["x"], matched["y"]
     _cursor_follow(args.x, args.y)
-    out = _focused_input(args, "click", lambda: inp.click(args.button, args.x, args.y),
-                         button=args.button, x=args.x, y=args.y)
+    count = max(1, getattr(args, "count", 1))
+
+    def _send_clicks() -> None:
+        for i in range(count):
+            if i:
+                time.sleep(0.08)  # quick enough to register as a double-click
+            inp.click(args.button, args.x, args.y)
+
+    extra = {"count": count} if count > 1 else {}
+    out = _focused_input(args, "click", _send_clicks,
+                         button=args.button, x=args.x, y=args.y, **extra)
     if matched:
         out.data["matched"] = matched["text"]
     return _then_shot(args, out)
@@ -594,6 +603,15 @@ def _key_list() -> Out:
     return Out({"keys": groups, "aliases": inp.KEY_ALIASES}, "\n".join(lines))
 
 
+def _split_chords(keys: list[str]) -> list[str]:
+    """Accept "ctrl+a" as well as "ctrl a": split every argument on "+".
+    A lone "+" is kept as is, so it is still resolved (or rejected) as a key name."""
+    out: list[str] = []
+    for k in keys:
+        out.extend([k] if k == "+" else [p for p in k.split("+") if p])
+    return out
+
+
 @command
 def _cmd_key(args: argparse.Namespace) -> Out:
     if args.list:
@@ -601,6 +619,7 @@ def _cmd_key(args: argparse.Namespace) -> Out:
     if not args.keys:
         raise CliError("no key given", hint="e.g. control key ctrl s; list names with: control key --list",
                        kind="usage_error")
+    args.keys = _split_chords(args.keys)
     unknown = [k for k in args.keys if inp.resolve_key(k) is None]
     if unknown:
         suggestions = difflib.get_close_matches(unknown[0].lower(),
@@ -1432,6 +1451,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     click = leaf(sub, "click", _cmd_click)
     click.add_argument("--button", default="left", choices=["left", "right", "middle"])
+    click.add_argument("--count", type=int, default=1, metavar="N",
+                       help="click N times in quick succession under one input lock "
+                            "(2 = double-click, e.g. to open an item in a file dialog)")
     click.add_argument("-x", type=int, default=None)
     click.add_argument("-y", type=int, default=None)
     click.add_argument("--text", default=None, metavar="REGEX",

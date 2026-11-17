@@ -82,6 +82,19 @@ class TestJsonEverywhere:
         assert json.loads(first)["keys"] == ["ctrl", "s"]
         assert json.loads(second)["x"] == 5
 
+    def test_key_accepts_plus_joined_chords(self, capsys):
+        with patch("control.cli.inp.key_combo") as mock_key:
+            _run(["key", "ctrl+shift+t", "--json"])
+            _run(["key", "ctrl+a", "BackSpace", "--json"])
+        assert [c.args for c in mock_key.call_args_list] == [("ctrl", "shift", "t"), ("ctrl", "a", "BackSpace")]
+
+    def test_click_count_repeats_the_click(self, capsys):
+        with patch("control.cli.inp.click") as mock_click, patch("control.cli.time.sleep"):
+            _run(["click", "-x", "5", "-y", "6", "--count", "2", "--json"])
+        assert mock_click.call_count == 2
+        mock_click.assert_called_with("left", 5, 6)
+        assert json.loads(capsys.readouterr().out)["count"] == 2
+
     def test_shot_json(self, capsys, tmp_path):
         with patch("control.cli.screenshot.fullscreen", return_value=tmp_path / "a.png"):
             _run(["shot", "--json"])

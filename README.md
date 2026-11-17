@@ -507,9 +507,15 @@ symbols) use `control type`, which handles layouts for you.
 
 ```
 control key ctrl shift t
+control key ctrl+shift+t            # same: "+"-joined chords are accepted too
 control key Control Return          # same as: control key ctrl enter
 control key --list --json
 ```
+
+`control click --count 2 ...` double-clicks (several clicks under one input lock),
+e.g. to open an item in a file dialog. `shot window` does not include popup menus
+or other override-redirect windows; to see an open menu use
+`control shot full --crop X,Y,W,H`.
 
 ## Reading the screen without image tokens
 
