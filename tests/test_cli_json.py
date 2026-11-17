@@ -95,6 +95,15 @@ class TestJsonEverywhere:
         mock_click.assert_called_with("left", 5, 6)
         assert json.loads(capsys.readouterr().out)["count"] == 2
 
+    def test_click_hover_moves_and_waits_before_clicking(self, capsys):
+        order = []
+        with patch("control.cli.inp.move_mouse", side_effect=lambda *a: order.append(("move", a))), \
+             patch("control.cli.time.sleep", side_effect=lambda s: order.append(("sleep", s))), \
+             patch("control.cli.inp.click", side_effect=lambda *a: order.append(("click", a))):
+            _run(["click", "-x", "5", "-y", "6", "--hover", "0.5", "--json"])
+        assert order[:2] == [("move", (5, 6)), ("sleep", 0.5)]
+        assert order[-1][0] == "click"
+
     def test_shot_json(self, capsys, tmp_path):
         with patch("control.cli.screenshot.fullscreen", return_value=tmp_path / "a.png"):
             _run(["shot", "--json"])

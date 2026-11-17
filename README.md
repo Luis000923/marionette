@@ -512,7 +512,8 @@ control key Control Return          # same as: control key ctrl enter
 control key --list --json
 ```
 
-`control click --count 2 ...` double-clicks (several clicks under one input lock),
+`control click --hover 0.5 ...` moves the pointer onto the target and waits before clicking (Roblox
+ignores a click that arrives without a prior hover). `control click --count 2 ...` double-clicks (several clicks under one input lock),
 e.g. to open an item in a file dialog. `shot window` does not include popup menus
 or other override-redirect windows; to see an open menu use
 `control shot full --crop X,Y,W,H`.

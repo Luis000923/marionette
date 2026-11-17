@@ -544,6 +544,10 @@ def _cmd_click(args: argparse.Namespace) -> Out:
     count = max(1, getattr(args, "count", 1))
 
     def _send_clicks() -> None:
+        hover = getattr(args, "hover", 0.0)
+        if hover > 0 and args.x is not None and args.y is not None:
+            inp.move_mouse(args.x, args.y)  # Roblox and some toolkits ignore a click with no prior hover
+            time.sleep(hover)
         for i in range(count):
             if i:
                 time.sleep(0.08)  # quick enough to register as a double-click
@@ -1454,6 +1458,10 @@ def build_parser() -> argparse.ArgumentParser:
     click.add_argument("--count", type=int, default=1, metavar="N",
                        help="click N times in quick succession under one input lock "
                             "(2 = double-click, e.g. to open an item in a file dialog)")
+    click.add_argument("--hover", type=float, default=0.0, metavar="SECONDS",
+                       help="move the pointer onto the target and wait this long before "
+                            "clicking (needed by Roblox and other apps that ignore a click "
+                            "without a prior hover; try 0.5)")
     click.add_argument("-x", type=int, default=None)
     click.add_argument("-y", type=int, default=None)
     click.add_argument("--text", default=None, metavar="REGEX",
